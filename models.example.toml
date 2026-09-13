@@ -1,0 +1,15 @@
+[app]
+data_dir = ".mini-agent"
+
+[runtime]
+soft_context_ratio = 0.70
+hard_context_ratio = 0.85
+target_context_ratio = 0.55
+
+[models.default]
+endpoint = "https://your-provider.example/v1/chat/completions"
+model = "your-tool-capable-model"
+api_key_env = "MINI_AGENT_API_KEY"
+mode = "native"
+context_window = 16384
+output_reserve = 2048
