@@ -4,7 +4,7 @@
  * 文件结构：
  *   1. 类型与常量     —— 与后端接口对齐的数据形状，以及错误码 / 工具 / 状态的中文映射
  *   2. 渲染工具函数   —— 轻量 Markdown 渲染、统一 fetch 封装、运行事件文案
- *   3. TraceGroups    —— “执行日志”视图：把一次会话的多次运行按轮次分组展示
+ *   3. TraceTimeline  —— “执行日志”视图：把一次会话的所有问答串成一条带层级的连续链路
  *   4. App            —— 会话 / 消息 / 运行 / 轨迹的状态机 + SSE 订阅 + 全部交互
  *
  * 约束：不引入路由与全局状态库，所有状态集中由 App 组件持有并向下传递。
@@ -19,7 +19,7 @@ import {
 // 以下类型与 backend 的接口返回逐一对应，字段变更需同步后端契约。
 type Model = { name: string; model: string; mode: string; context_window: number }
 type Session = { id: string; model_name: string; timezone: string; title: string | null; created_at: string }
-type Message = { role: string; content?: string; thinking?: string; seq: number; tool_calls?: unknown[]; name?: string }
+type Message = { role: string; content?: string; thinking?: string; seq: number; tool_calls?: unknown[]; name?: string; run_id?: string }
 type Run = { id: string; status: string; answer?: string; input_preview?: string; error?: { code: string }; model_calls?: number; created_at?: string; finished_at?: string }
 type TraceItem = { id: number; event_type: string; created_at: string; payload: Record<string, unknown> }
 type SessionTraceItem = TraceItem & { run_id: string }
@@ -183,10 +183,20 @@ const tracePresentation = (item: TraceItem) => {
   const iteration = payload.iteration ? `第 ${payload.iteration} 轮` : ''
   // 裁剪事件才有 token 数值：两个字段都齐全才拼成备注，避免出现"约 undefined / undefined tokens"。
   const tokens = typeof payload.estimated_tokens === 'number' && typeof payload.input_budget === 'number' ? `约 ${payload.estimated_tokens} / ${payload.input_budget} tokens` : ''
+  // 模型调用事件的统一元信息：耗时 + 首字延迟 + token 用量。哪个字段缺失就跳过哪个——
+  // 上游没回 usage 时（没开 stream_options）就不显示，而不是显示 0。
+  const callMeta = (() => {
+    const parts = [duration]
+    if (typeof payload.ttft_ms === 'number') parts.push(`首字 ${Math.round(payload.ttft_ms)} 毫秒`)
+    if (typeof payload.input_tokens === 'number' && typeof payload.output_tokens === 'number') {
+      parts.push(`${payload.input_tokens} / ${payload.output_tokens} tokens`)
+    }
+    return parts.filter(Boolean).join(' · ')
+  })()
   switch (item.event_type) {
     case 'run.started': return { icon: CircleDashed, tone: 'active', title: '开始运行', description: '已接收用户消息，Agent 开始处理。', meta: '' }
     case 'model.started': return { icon: BrainCircuit, tone: 'active', title: payload.phase === 'summary' ? '压缩上下文' : '请求模型', description: `${iteration || '当前轮次'}，模型正在判断直接回答还是调用工具。`, meta: `第 ${payload.attempt || 1} 次尝试` }
-    case 'model.finished': return { icon: CheckCircle2, tone: 'success', title: payload.phase === 'summary' ? '上下文压缩完成' : '模型响应完成', description: '模型已返回可处理的响应。', meta: duration }
+    case 'model.finished': return { icon: CheckCircle2, tone: 'success', title: payload.phase === 'summary' ? '上下文压缩完成' : '模型响应完成', description: '模型已返回可处理的响应。', meta: callMeta }
     case 'model.retry': return { icon: AlertCircle, tone: 'warning', title: '模型请求重试', description: `请求未成功，正在自动重试。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: duration }
     case 'model.failed': return { icon: AlertCircle, tone: 'danger', title: '模型请求失败', description: `模型服务请求失败。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: duration }
     case 'model.invalid': return { icon: AlertCircle, tone: 'warning', title: '模型响应格式修复', description: `响应格式不符合协议，Agent 将要求模型重新返回。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: iteration }
@@ -209,32 +219,98 @@ const tracePresentation = (item: TraceItem) => {
 }
 
 // —— 3. 执行日志视图 ——
-type TraceGroupsProps = {
+// 把一次会话的全部问答链路串成一条连续的层级时间线：每轮以用户提问开头、按 parent_id 还原
+// 父子关系把事件排成两级缩进、以最终回答收尾。默认全展开，单击轮次头折叠该轮。
+type TraceTimelineProps = {
   trace: SessionTraceItem[]
   runs: Run[]
-  expandedRunId: string | null
+  messages: Message[]
+  collapsedRuns: Set<string>
   onToggle: (runId: string) => void
 }
 
-// 按 run_id 把同一次运行的轨迹聚合成可折叠分组；折叠状态由父组件持有，便于切换会话时统一重置。
-const TraceGroups = ({ trace, runs, expandedRunId, onToggle }: TraceGroupsProps) => {
-  const runIds = [...new Set(trace.map(item => item.run_id))]
-  return <div className="trace-groups">{runIds.map(id => {
-    const request = runs.find(runItem => runItem.id === id)
-    const items = trace.filter(item => item.run_id === id)
-    const expanded = expandedRunId === id
-    return <section className={`trace-group ${expanded ? 'expanded' : ''}`} key={id}>
-      <button className="trace-group-toggle" onClick={() => onToggle(id)} aria-expanded={expanded}>
-        <span className="trace-group-main"><span className="trace-group-kicker">{new Date(request?.created_at || items[0].created_at).toLocaleString('zh-CN', { hour12: false })}</span><strong>{request?.input_preview || `运行 ${id.slice(0, 8)}`}</strong></span>
-        <span className="trace-group-meta"><span className="trace-step-count">{items.length} 个步骤</span><span className={`run-status ${request?.status || ''}`}>{STATUS_NAMES[request?.status || ''] || '已完成'}</span><ChevronDown size={16}/></span>
-      </button>
-      {expanded && <ol className="trace-list">{items.map((item, index) => {
-        const presentation = tracePresentation(item)
-        const Icon = presentation.icon
-        return <li key={`${item.run_id}-${item.id}`} className={`trace-step ${presentation.tone}`}><div className="trace-marker"><Icon size={15}/></div><div className="trace-content"><div className="trace-title"><strong>{index + 1}. {presentation.title}</strong><time>{new Date(item.created_at).toLocaleTimeString('zh-CN', { hour12: false })}</time></div><p>{presentation.description}</p>{presentation.meta && <span className="trace-meta">{presentation.meta}</span>}{Object.keys(item.payload).length > 0 && <details><summary>查看事件数据</summary><pre>{JSON.stringify(item.payload, null, 2)}</pre></details>}</div></li>
-      })}</ol>}
-    </section>
-  })}</div>
+// 把同一 run 的扁平事件按 parent_id 还原成两级树，展平成带深度的列表。父级缺失/非数字
+// 的事件当作顶层（model.started / run.* 都是这种情况）。
+const buildTraceTree = (events: SessionTraceItem[]): { item: SessionTraceItem; depth: number }[] => {
+  const children = new Map<number, SessionTraceItem[]>()
+  const roots: SessionTraceItem[] = []
+  events.forEach(event => {
+    const pid = (event.payload as { parent_id?: number }).parent_id
+    if (typeof pid === 'number') {
+      const arr = children.get(pid) ?? []
+      arr.push(event)
+      children.set(pid, arr)
+    } else {
+      roots.push(event)
+    }
+  })
+  const out: { item: SessionTraceItem; depth: number }[] = []
+  const dfs = (node: SessionTraceItem, depth: number) => {
+    out.push({ item: node, depth })
+    const kids = children.get(Number(node.id)) ?? []
+    kids.sort((a, b) => a.id - b.id).forEach(child => dfs(child, depth + 1))
+  }
+  roots.sort((a, b) => a.id - b.id).forEach(root => dfs(root, 0))
+  return out
+}
+
+// 把该 run 里所有 model.finished 的 token 用量相加，得到这一轮的总成本。
+const sumModelTokens = (events: SessionTraceItem[]): { input: number; output: number; has: boolean } => {
+  let input = 0
+  let output = 0
+  events.forEach(event => {
+    const payload = event.payload as { input_tokens?: number; output_tokens?: number }
+    if (typeof payload.input_tokens === 'number') input += payload.input_tokens
+    if (typeof payload.output_tokens === 'number') output += payload.output_tokens
+  })
+  return { input, output, has: input > 0 || output > 0 }
+}
+
+const TraceTimeline = ({ trace, runs, messages, collapsedRuns, onToggle }: TraceTimelineProps) => {
+  const sortedRuns = [...runs].sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
+  return <div className="trace-flow">
+    {sortedRuns.map((run, index) => {
+      const events = trace.filter(event => event.run_id === run.id).sort((a, b) => a.id - b.id)
+      // 用户提问：取这一 run 第一条用户消息（按 seq 最小即可，filter 后顺序已稳定）。
+      const userQuestion = messages.find(message => message.run_id === run.id && message.role === 'user')?.content
+      // 最终回答：取这一 run 最后一条无 tool_calls 的助手消息——tool_calls 轮只是决策说明，不是答案。
+      const finalAnswer = [...messages].reverse().find(message => message.run_id === run.id && message.role === 'assistant' && !message.tool_calls)?.content
+      const flat = buildTraceTree(events)
+      const tokens = sumModelTokens(events)
+      const collapsed = collapsedRuns.has(run.id)
+      const finishedMs = run.finished_at ? new Date(run.finished_at).getTime() : null
+      const createdMs = run.created_at ? new Date(run.created_at).getTime() : null
+      const totalMs = finishedMs !== null && createdMs !== null && finishedMs >= createdMs ? finishedMs - createdMs : null
+      return <section className={`trace-turn ${collapsed ? 'collapsed' : 'expanded'}`} key={run.id}>
+        <button className="trace-turn-toggle" onClick={() => onToggle(run.id)} aria-expanded={!collapsed}>
+          <span className="trace-turn-kicker"><strong>第 {index + 1} 轮</strong>{run.created_at && <time>{new Date(run.created_at).toLocaleString('zh-CN', { hour12: false })}</time>}<span className={`run-status ${run.status}`}>{STATUS_NAMES[run.status] || '已完成'}</span></span>
+          {userQuestion && <span className="trace-turn-question">{userQuestion}</span>}
+          <span className="trace-turn-stats"><span>{events.length} 个步骤</span>{tokens.has && <span>{tokens.input} / {tokens.output} tokens</span>}{totalMs !== null && totalMs >= 0 && <span>{Math.round(totalMs)} 毫秒</span>}<ChevronDown size={14}/></span>
+        </button>
+        {!collapsed && <>
+          <ol className="trace-list">
+            {flat.map(({ item, depth }) => {
+              const presentation = tracePresentation(item)
+              const Icon = presentation.icon
+              return <li key={item.id} className={`trace-step ${presentation.tone} depth-${depth}`} style={{ marginLeft: depth * 16 }}>
+                <div className="trace-marker"><Icon size={15}/></div>
+                <div className="trace-content">
+                  <div className="trace-title"><strong>{presentation.title}</strong><time>{new Date(item.created_at).toLocaleTimeString('zh-CN', { hour12: false })}</time></div>
+                  <p>{presentation.description}</p>
+                  {presentation.meta && <span className="trace-meta">{presentation.meta}</span>}
+                  {Object.keys(item.payload).length > 0 && <details><summary>查看事件数据</summary><pre>{JSON.stringify(item.payload, null, 2)}</pre></details>}
+                </div>
+              </li>
+            })}
+          </ol>
+          {finalAnswer && <div className="trace-turn-answer">
+            <header><strong>回答</strong></header>
+            <p>{finalAnswer}</p>
+          </div>}
+        </>}
+      </section>
+    })}
+  </div>
 }
 
 // 思考过程面板：对齐主流产品的默认行为 —— 思考中自动展开并走计时，回答完成后自动折叠成一行。
@@ -267,7 +343,8 @@ export default function App() {
   const [run, setRun] = useState<Run | null>(null)
   const [runs, setRuns] = useState<Run[]>([])
   const [trace, setTrace] = useState<SessionTraceItem[]>([])
-  const [expandedTraceRun, setExpandedTraceRun] = useState<string | null>(null)
+  // 默认全展开；每轮可单独折叠。Set 比单一 id 更适合"同时多轮折叠、互不打架"的场景。
+  const [collapsedRuns, setCollapsedRuns] = useState<Set<string>>(() => new Set())
   const [view, setView] = useState<View>('chat')
   const [sidebar, setSidebar] = useState(false)
   const [sessionsCollapsed, setSessionsCollapsed] = useState(() => {
@@ -296,7 +373,7 @@ export default function App() {
   // 以便刷新页面后仍停留在同一个会话。
   const selectSession = (id: string) => {
     eventSourceRef.current?.close(); eventSourceRef.current = null; selectedRef.current = id; runStartedAt.current = null
-    setSelected(id); setSidebar(false); setMessages([]); setRun(null); setRuns([]); setTrace([]); setExpandedTraceRun(null); setView('chat'); setError(''); setNotice('')
+    setSelected(id); setSidebar(false); setMessages([]); setRun(null); setRuns([]); setTrace([]); setCollapsedRuns(new Set()); setView('chat'); setError(''); setNotice('')
     const url = new URL(location.href)
     if (id) url.searchParams.set('session', id)
     else url.searchParams.delete('session')
@@ -547,7 +624,7 @@ export default function App() {
         <div className="trace-header"><div><h2>执行日志</h2><p>按问题查看 Agent 的完整处理步骤、工具调用和模型响应。</p></div><span className="trace-count">{runs.length}</span></div>
         {!selected && <div className="trace-empty"><ListTree size={26}/><h3>请先选择会话</h3><p>选择左侧会话后查看执行链路。</p></div>}
         {selected && !trace.length && <div className="trace-empty"><ListTree size={26}/><h3>暂无执行记录</h3><p>发送问题后，这里会显示 Agent 的处理步骤。</p></div>}
-        {selected && trace.length > 0 && <TraceGroups trace={trace} runs={runs} expandedRunId={expandedTraceRun} onToggle={id => setExpandedTraceRun(current => current === id ? null : id)}/>} 
+        {selected && trace.length > 0 && <TraceTimeline trace={trace} runs={runs} messages={messages} collapsedRuns={collapsedRuns} onToggle={id => setCollapsedRuns(current => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next })}/>} 
       </section>}
       {error && <div className="error-bar"><AlertCircle size={16}/><span>{error}</span><button className="icon" onClick={() => setError('')} title="关闭提示"><X size={15}/></button></div>}
       {/* 输入区：Enter 发送 / Shift+Enter 换行；运行中时发送键切换为停止键 */}

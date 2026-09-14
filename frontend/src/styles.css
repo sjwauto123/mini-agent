@@ -117,17 +117,22 @@ header p { margin: 3px 0 0; color: var(--subtle); font-size: 11px; overflow: hid
 .run-summary > div:last-child { border-right: 0; }
 .run-summary span { color: #888; font-size: 11px; }
 .run-summary strong { overflow: hidden; color: #333; font-size: 13px; font-weight: 600; text-overflow: ellipsis; }
-.trace-group { margin-top: 22px; padding: 18px 20px 4px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
-.trace-group-toggle { width: 100%; padding: 0 0 14px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; color: inherit; text-align: left; cursor: pointer; }
-.trace-group-toggle:hover .trace-group-main > strong { color: #111; }
-.trace-group-main { min-width: 0; display: grid; gap: 5px; }
-.trace-group-kicker { color: #999; font-size: 10px; }
-.trace-group-main > strong { overflow: hidden; color: #333; font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; transition: color .15s ease; }
-.trace-group-meta { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; color: #999; }
-.trace-step-count { font-size: 11px; white-space: nowrap; }
-.trace-group-meta > svg { transition: transform .15s ease; }
-.trace-group.expanded .trace-group-meta > svg { transform: rotate(180deg); color: #555; }
-.trace-group .trace-list { padding-top: 18px; }
+.trace-flow { display: grid; gap: 18px; }
+/* 一轮问答：用户提问 → 按 parent_id 还原的事件树 → 最终回答，全部在同一个折叠区域里。
+   默认展开，旋转的 chevron 与已有的折叠交互保持一致。 */
+.trace-turn { padding: 18px 22px 6px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+.trace-turn-toggle { width: 100%; display: grid; gap: 8px; padding: 0 0 14px; border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.trace-turn-toggle:hover .trace-turn-question { color: #111; }
+.trace-turn-kicker { display: flex; align-wrap: wrap; gap: 12px; align-items: center; color: #777; font-size: 11px; }
+.trace-turn-kicker strong { color: #333; font-size: 13px; font-weight: 650; }
+.trace-turn-kicker time { color: #999; }
+.trace-turn-question { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: #444; font-size: 14px; line-height: 1.55; }
+.trace-turn-stats { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; color: #999; font-size: 11px; }
+.trace-turn-stats > svg { margin-left: auto; transition: transform .15s ease; }
+.trace-turn.expanded .trace-turn-stats > svg { transform: rotate(180deg); color: #555; }
+.trace-turn-answer { margin: 18px 0 6px; padding: 14px 16px; border-left: 3px solid #d8e3f3; border-radius: 6px; background: #f6f9ff; }
+.trace-turn-answer header { margin-bottom: 6px; color: #3565a9; font-size: 11px; letter-spacing: .5px; }
+.trace-turn-answer p { margin: 0; color: #2d2d2d; font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
 .trace-empty { min-height: 360px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #999; text-align: center; }
 .trace-empty h3 { margin: 13px 0 5px; color: #4b4b4b; font-size: 15px; }
 .trace-empty p { margin: 0; font-size: 12px; }
