@@ -1,5 +1,5 @@
 from mini_agent.contracts import ExecutionContext
-from mini_agent.tools import ToolRegistry, ToolSpec, calculator
+from mini_agent.tools import calculator
 
 
 async def test_calculator_is_safe():

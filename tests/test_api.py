@@ -8,7 +8,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from mini_agent.api import create_app
+from mini_agent.api import _submission_status, create_app
 from mini_agent.config import AppConfig, ModelConfig
 from mini_agent.storage import migrate_database
 
@@ -296,6 +296,40 @@ def test_session_with_unconfigured_model_is_not_reported_as_missing(tmp_path: Pa
         rejected = client.post("/api/sessions/ghost-session/runs", json={"message": "hi"})
         assert rejected.status_code == 503
         assert rejected.json()["detail"]["code"] == "model_not_configured"
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("session_busy", 409),                  # 会话冲突
+        ("model_api_key_missing", 503),         # 服务端配置问题
+        ("message_required", 400),              # 在 ERROR_ANSWERS 里、却不在 SUBMIT_HTTP_STATUS 里
+        ("some_unexpected_internal_failure", 500),  # 未收录：不能把服务端 bug 说成用户输入问题
+    ],
+)
+def test_submission_status_covers_every_branch(code: str, expected: int):
+    """错误码 → HTTP 状态的四条分支都要有覆盖。
+
+    最后那条 fallback（``400 if code in KNOWN_CODES else 500``）曾经长期零覆盖，因此
+    ``KNOWN_CODES`` 漏导入时整套测试仍然全绿，直到有人发一条纯空白消息才暴露成裸 500。
+    """
+    assert _submission_status(code) == expected
+
+
+def test_blank_message_is_rejected_as_bad_request(tmp_path: Path):
+    """纯空白消息要回 400 + 可读文案，而不是 500 无结构文本。
+
+    ``"   "`` 能通过 pydantic 的 ``min_length=1``，是在运行时被判为"消息为空"的，
+    因此这条请求会真实走到接口层的错误码映射，正是上面那条 fallback 分支。
+    """
+    config = make_config(tmp_path)
+    migrate_database(tmp_path / "state.db")
+    with TestClient(create_app(config, {"test": ScriptedModel([final("ok")])})) as client:
+        session_id = client.post("/api/sessions", json={"model_name": "test"}).json()["id"]
+        rejected = client.post(f"/api/sessions/{session_id}/runs", json={"message": "   "})
+        assert rejected.status_code == 400
+        assert rejected.json()["detail"]["code"] == "message_required"
+        assert rejected.json()["detail"]["message"] == "请输入消息。"
 
 
 def test_run_records_hide_internal_fields(tmp_path: Path):

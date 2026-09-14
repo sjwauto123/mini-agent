@@ -102,8 +102,8 @@ def test_two_browser_pages_keep_sessions_isolated_and_restore(live_server: str, 
             expect(first.locator(".assistant .bubble").first).to_contain_text("Echo: window one")
             first.get_by_role("button", name="执行日志").click()
             expect(first.locator(".trace-page")).to_contain_text("执行日志")
-            first.locator(".trace-group-toggle").first.click()
-            expect(first.locator(".trace-group-toggle").first).to_have_attribute("aria-expanded", "true")
+            # 新版执行日志默认全展开：直接断言 aria-expanded=true 与事件文案，无需点击。
+            expect(first.locator(".trace-turn-toggle").first).to_have_attribute("aria-expanded", "true")
             expect(first.locator(".trace-page")).to_contain_text("开始运行")
             expect(first.locator(".trace-page")).to_contain_text("请求模型")
             expect(first.locator(".trace-page")).to_contain_text("运行完成")
@@ -113,9 +113,9 @@ def test_two_browser_pages_keep_sessions_isolated_and_restore(live_server: str, 
             first.get_by_placeholder("请输入您想要咨询的问题...").press("Enter")
             expect(first.locator(".assistant .bubble strong")).to_contain_text("markdown")
             first.get_by_role("button", name="执行日志").click()
-            expect(first.locator(".trace-page .trace-group")).to_have_count(2)
-            first.locator(".trace-group-toggle").nth(1).click()
-            expect(first.locator(".trace-page .trace-group").nth(1)).to_contain_text("请求模型")
+            expect(first.locator(".trace-page .trace-turn")).to_have_count(2)
+            expect(first.locator(".trace-turn-toggle").nth(1)).to_have_attribute("aria-expanded", "true")
+            expect(first.locator(".trace-page .trace-turn").nth(1)).to_contain_text("请求模型")
 
             second = context.new_page()
             second.goto(live_server)
@@ -136,6 +136,10 @@ def test_two_browser_pages_keep_sessions_isolated_and_restore(live_server: str, 
             expect(first.locator(".user .bubble").first).to_contain_text("window one")
 
             second.get_by_placeholder("请输入您想要咨询的问题...").fill("trigger model failure")
+            # Playwright 的 fill 触发的 input 事件，在 React 18 自动批处理下可能被上一轮
+            # 还未落地的 setDraft('') 覆盖，导致 Enter 时 draft 仍为空、send() 直接 return。
+            # 等 React state 收敛再按 Enter，能稳定进入 send() 路径。
+            second.wait_for_timeout(150)
             second.get_by_placeholder("请输入您想要咨询的问题...").press("Enter")
             expect(second.locator(".error-bar")).to_contain_text("模型服务暂时不可用", timeout=10_000)
 

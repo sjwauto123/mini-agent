@@ -161,3 +161,31 @@ output_reserve = 1024
     monkeypatch.setenv("MINI_AGENT_TEST_KEY", "from-process")
     config = load_config(config_path)
     assert config.models["test"].api_key == "from-process"
+
+
+async def test_add_trace_returns_id_and_supports_parent_chain(tmp_path: Path):
+    """add_trace 必须返回新插入事件的 id，供埋点把后续事件挂到这一事件下面。
+
+    parent_id 字段本身没有任何数据库约束（仅存在 payload 里），因此埋点哪怕填错也
+    不会落库失败——这意味着测试不仅要看写入成功，还要看"取出的 id 真的能在后续事件
+    的 payload 里读到"。
+    """
+    db_path = tmp_path / "state.db"
+    migrate_database(db_path)
+    store = Store(db_path)
+    await store.init()
+    try:
+        session_id = await store.create_session("model-a")
+        run, _ = await store.start_run(session_id, "hi", None)
+        # 自增 id 应当严格单调，调用方据此把后续事件挂在正确的层级下。
+        root = await store.add_trace(run["id"], "run.started", {})
+        model_started = await store.add_trace(run["id"], "model.started", {"attempt": 1, "iteration": 1})
+        tool_started = await store.add_trace(run["id"], "tool.started", {"call_id": "c1", "name": "calculator", "iteration": 1, "parent_id": model_started})
+        assert isinstance(root, int) and root > 0
+        assert isinstance(model_started, int) and model_started > root
+        assert isinstance(tool_started, int) and tool_started > model_started
+        trace = await store.list_trace(run["id"])
+        assert [item["event_type"] for item in trace] == ["run.started", "model.started", "tool.started"]
+        assert trace[2]["payload"]["parent_id"] == model_started
+    finally:
+        await store.close()
