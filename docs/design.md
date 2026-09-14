@@ -155,6 +155,8 @@ SSE 先建立订阅再读取/发送当前快照，然后推送新事件，避免
 
 前端仅会话列表、聊天、模型选择、输入/资料、停止、可展开 trace。每个请求携带对应 session_id，不共享一个会污染其他窗口的全局当前会话。
 
+trace 事件的层级与单次会话视图：每个 trace 事件落在 `trace_events` 表，自增 id 保序。事件可携带 `parent_id`（指向同一 run 中另一条事件）以构造两级树——顶层为 `model.started` / `run.*` / `context.*` / `assistant.delta`，挂在其下的是它本轮产生的 `model.finished` 与 `tool.started`/`tool.finished`。`add_trace` 返回新插入事件的 id，是 `parent_id` 链路得以串起来的前提。`model.finished` 同时带 `input_tokens` / `output_tokens`（取自上游 `usage` 字段，流式需 `stream_options.include_usage`）与 `ttft_ms`（首个内容/推理增量到达的时刻，区分"服务慢"与"答案长"）；上游没回 usage 时**不写**这两个字段——"没测到"和"测到是 0"在成本统计里是两回事。执行日志视图把一次会话的全部问答串成一条连续时间线：每轮以用户提问开头、事件按 `parent_id` 排成两级缩进、以最终回答收尾，默认全展开、单轮可折叠。
+
 ## 7. 错误与中断
 
 - 错误码只有一处来源（`errors` 模块）：异常→错误码的归一化与用户可读文案都从那里取，运行时、接口层、前端不再各写一套字符串判断，避免同一个失败在不同层得出不同的码。错误码集合只增不改，未收录的标识退回异常类名而不是硬塞进码里。
