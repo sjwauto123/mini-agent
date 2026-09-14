@@ -305,13 +305,23 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
                         event = None
                     if event is not None:
                         if event.get("type") == "delta":
-                            payload = json.dumps({"seq": event.get("seq"), "content": event.get("content") or "", "thinking": event.get("thinking") or ""}, ensure_ascii=False)
+                            message = {"seq": event.get("seq"), "content": event.get("content") or "", "thinking": event.get("thinking") or ""}
+                            # 工具轮在结束的那一刻就带上 tool_calls：前端据此立即改显示成
+                            # "调用了 N 个工具"，而不会继续把决策说明当回答渲染（那会与思考面板重复）。
+                            if event.get("tool_calls"):
+                                message["tool_calls"] = event["tool_calls"]
+                            payload = json.dumps(message, ensure_ascii=False)
                             if payload != previous_message:
                                 yield f"event: message\ndata: {payload}\n\n"
                                 previous_message = payload
                         elif event.get("type") == "discard":
                             # 这一轮被作废（协议非法，或重试要从头再流一遍）：让前端把该条消息撤掉。
                             yield f"event: discard\ndata: {json.dumps({'seq': event.get('seq')}, ensure_ascii=False)}\n\n"
+                        elif event.get("type") == "notice":
+                            # 过程性提示（如"上游无响应，正在重试"）：不改变任何数据，
+                            # 只是让长时间没有增量的沉默期在界面上有解释。
+                            notice = {key: value for key, value in event.items() if key != "type"}
+                            yield f"event: notice\ndata: {json.dumps(notice, ensure_ascii=False)}\n\n"
                     # 增量之外再对一次数据库：运行状态快照与终态收尾始终以数据库为唯一真相。
                     run = public_run(await svc(request).store.get_run(run_id))
                     if not run:

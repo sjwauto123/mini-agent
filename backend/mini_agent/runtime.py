@@ -41,6 +41,13 @@ def _backoff_delay(attempt: int) -> float:
     return min(.5 * 2 ** attempt, 4)
 
 
+# 语言约束单独作为最后一条系统消息追加。
+# 只写在 SYSTEM_PROMPT（消息列表开头）与协议提示的句尾都不够稳：实测第 1 轮仍整轮返回
+# 英文推理（1000+ 字，会原样显示在界面的思考面板里）。把要求独立成"紧贴模型输出的最后
+# 一条消息"后遵从率明显提高——位置比措辞更关键，所以不与协议提示合并，也不放开头。
+LANGUAGE_HINT = "推理过程与回答一律使用中文，不要使用英文推理。"
+
+
 def _model_output_head(raw: dict[str, Any], limit: int = 160) -> dict[str, Any]:
     """取出模型正文开头、结束原因与用量，仅用于在 trace 里定位协议错误原因。
 
@@ -192,7 +199,9 @@ class AgentRuntime:
                 await self.store.add_trace(run_id, event, {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "code": type(exc).__name__, "detail": str(exc)[:300], "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
                 if attempt + 1 < max_attempts:
                     # 退避 .5s → 1s → 2s…，避免服务端抖动时连环重试。
-                    await asyncio.sleep(_backoff_delay(attempt))
+                    delay = _backoff_delay(attempt)
+                    self._notify_retry(run_id, attempt + 2, delay, type(exc).__name__)
+                    await asyncio.sleep(delay)
             except httpx.HTTPStatusError as exc:
                 # 只对"可能自愈"的状态码重试；4xx 里的参数/鉴权错误重试没有意义，直接抛出。
                 if exc.response.status_code not in {429, 500, 502, 503, 504}:
@@ -201,13 +210,24 @@ class AgentRuntime:
                 event = "model.retry" if attempt + 1 < max_attempts else "model.failed"
                 await self.store.add_trace(run_id, event, {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "code": f"http_{exc.response.status_code}", "detail": str(exc)[:300], "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
                 if attempt + 1 < max_attempts:
-                    await asyncio.sleep(_backoff_delay(attempt))
+                    delay = _backoff_delay(attempt)
+                    self._notify_retry(run_id, attempt + 2, delay, f"http_{exc.response.status_code}")
+                    await asyncio.sleep(delay)
             except ModelServiceError as exc:
                 # 鉴权、请求参数、响应结构类失败：重试没有意义，带稳定错误码直接上报。
                 # 但仍要落一条 trace，否则会出现"运行明确失败、日志却查不到原因"。
                 await self.store.add_trace(run_id, "model.failed", {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "code": exc.code, "detail": exc.detail[:300], "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
                 raise
         raise RuntimeError("model_unavailable") from last_error
+
+    def _notify_retry(self, run_id: str, next_attempt: int, delay: float, reason: str) -> None:
+        """把"正在重试"推给前端。
+
+        上游长时间不响应时（实测有 20.9 秒才抛 RemoteProtocolError 的情况），数据库状态一直
+        没有变化，快照也就一直推不出内容，界面看上去像卡死。这条提示与运行结果无关，
+        只负责解释这段沉默；总线在没有订阅者时是空操作，所以无需判断连接状态。
+        """
+        self.events.publish(run_id, {"type": "notice", "code": "model_retry", "attempt": next_attempt, "delay_ms": round(delay * 1000), "reason": reason})
 
     async def _await_task(self, run_id: str, task: "asyncio.Task[Any]") -> Any:
         """等待任务完成，期间按 100ms 轮询取消标志 —— 协作式取消的落点。"""
@@ -429,6 +449,9 @@ class AgentRuntime:
                 tool_choice = "none" if run_now and run_now["model_calls"] >= self.max_model_calls - 1 else "auto"
                 # 协议约定放在消息末尾：紧邻生成位置，模型遵从率明显高于混在开头 system 里。
                 bundle.messages.append({"role": "system", "content": _protocol_hint(mode, tools)})
+                # 语言约束再单独追加一条，成为模型的最后一条输入：只写在开头 SYSTEM_PROMPT
+                # 或协议提示句尾时，实测第 1 轮仍会整轮用英文推理。
+                bundle.messages.append({"role": "system", "content": LANGUAGE_HINT})
                 # 第 3 步：流式调用模型。增量在到达当下就落库并广播，前端因此是逐字生长，
                 # 而不是像过去那样"等整段生成完，再按固定步长把完整答案回放一遍"。
                 content = thinking = ""
@@ -531,13 +554,19 @@ class AgentRuntime:
                         tool_payload["thinking"] = thinking[:8000]
                     if assistant_seq is None:
                         # 模型没有产出任何增量（直接给出工具调用）：工具调用就是这一轮唯一的产物。
-                        await self.store.add_message(session_id, run_id, "assistant", tool_payload)
+                        # 这里不回填 assistant_seq：它是"流式落过库、需要时可撤回"的标记，
+                        # 而这条消息是工具调用的记录，必须一直留在历史里。
+                        recorded_seq = await self.store.add_message(session_id, run_id, "assistant", tool_payload)
                     else:
                         # 流式期间已经落了本轮的助手消息（含思考过程）：把工具调用补到同一条上，
                         # 不要另起一条，否则界面上会出现"只有思考、没有下文"的空壳消息。
                         # 这一轮到此已经有了确定结论（调用工具），同样摘掉 incomplete 标记。
                         await self.store.update_message_fields(session_id, assistant_seq, {**tool_payload, "incomplete": False})
-                        self.events.publish(run_id, {"type": "delta", "seq": assistant_seq, "content": tool_payload.get("content") or "", "thinking": tool_payload.get("thinking") or ""})
+                        recorded_seq = assistant_seq
+                    # 这一轮已确定是工具调用，立刻把这个事实推给前端。否则前端要等运行结束拉全量
+                    # 消息才知道，那期间会把决策说明当成回答渲染（与思考面板重复一遍），
+                    # 而且"调用了 N 个工具"也要等整轮跑完才出现。
+                    self.events.publish(run_id, {"type": "delta", "seq": recorded_seq, "content": tool_payload.get("content") or "", "thinking": tool_payload.get("thinking") or "", "tool_calls": tool_payload["tool_calls"]})
                     await self.store.add_trace(run_id, "tool.started", {"call_id": event.call_id, "name": event.name, "iteration": iteration})
                     # 工具结果的预算按工具类型分配：检索类给得少（1%），其余给 10%，并受剩余上下文约束。
                     ratio = .02 if event.name == "resource_search" else .10
