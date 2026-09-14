@@ -5,6 +5,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 from mini_agent.config import load_config
+from mini_agent.errors import ERROR_ANSWERS
 from mini_agent.storage import Store, migrate_database
 
 
@@ -44,7 +45,40 @@ async def test_init_marks_abandoned_run_interrupted(tmp_path: Path):
         restored = await second.get_run(run["id"])
         assert restored["status"] == "interrupted"
         assert restored["error"] == {"code": "service_restarted"}
-        assert (await second.list_messages(session_id))[0]["content"] == "hello"
+        messages = await second.list_messages(session_id)
+        assert messages[0]["content"] == "hello"
+        # 收尾要写满三处：runs 状态、执行日志、说明消息。缺任何一处，这次运行看起来都像"断在半路"：
+        # 没有轨迹则执行日志没有收尾步骤，没有消息则用户的话下面空无一物。
+        trace = await second.list_trace(run["id"])
+        assert [item["event_type"] for item in trace] == ["run.finished"]
+        assert trace[0]["payload"] == {"status": "interrupted", "code": "service_restarted"}
+        assert [item["role"] for item in messages] == ["user", "assistant"]
+        assert messages[1]["content"] == ERROR_ANSWERS["service_restarted"]
+        assert messages[1]["interrupted"] is True
+    finally:
+        await second.close()
+
+
+async def test_init_keeps_partial_answer_without_adding_second_message(tmp_path: Path):
+    """流式中途断掉时已经落了一条 incomplete 的助手消息：收尾只补轨迹，不能再加一条气泡。"""
+    db_path = tmp_path / "state.db"
+    migrate_database(db_path)
+    first = Store(db_path)
+    await first.init()
+    session_id = await first.create_session("model-a")
+    run, _ = await first.start_run(session_id, "hello", None)
+    await first.add_message(session_id, run["id"], "user", {"content": "hello"})
+    await first.add_message(session_id, run["id"], "assistant", {"content": "说到一半", "incomplete": True})
+    await first.close()
+
+    second = Store(db_path)
+    await second.init()
+    try:
+        messages = await second.list_messages(session_id)
+        assert [item["role"] for item in messages] == ["user", "assistant"]
+        assert messages[1]["content"] == "说到一半"
+        # 轨迹仍然要补：消息已存在不代表这次运行有收尾记录。
+        assert [item["event_type"] for item in await second.list_trace(run["id"])] == ["run.finished"]
     finally:
         await second.close()
 
