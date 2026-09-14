@@ -4,10 +4,11 @@ import re
 
 import httpx
 
+from mini_agent.context import TRIM_NOTICE
 from mini_agent.contracts import ToolResult
 from mini_agent.errors import ModelServiceError
 from mini_agent.events import RunEventBus
-from mini_agent.runtime import LANGUAGE_HINT, AgentRuntime
+from mini_agent.runtime import LANGUAGE_HINT, SAFETY_HINT, AgentRuntime
 from mini_agent.tools import ToolSpec
 
 from .fakes import ScriptedModel, final, tool
@@ -139,6 +140,12 @@ async def test_blank_body_retries_with_minimal_context(services):
     repairs = [item for item in trace if item["event_type"] == "model.repair"]
     assert repairs and repairs[-1]["payload"]["minimal_context"] is True
 
+    # 退化路径丢掉了第一轮的历史与摘要，属于"记忆不完整"：必须同时告知模型并在 trace 留痕。
+    # 只靠"回答看起来不对"是发现不了的——用户与日志都看不到上下文曾被降级。
+    assert TRIM_NOTICE in recovery
+    trimmed = [item for item in trace if item["event_type"] == "context.trimmed"]
+    assert trimmed and trimmed[-1]["payload"]["minimal_context"] is True
+
 
 async def test_model_unavailable_has_readable_error_and_trace(services):
     class UnavailableModel:
@@ -222,9 +229,12 @@ async def test_retry_is_announced_and_language_hint_is_the_last_message(services
     assert notices[0]["code"] == "model_retry"
     assert notices[0]["attempt"] == 2 and notices[0]["delay_ms"] == 500
 
-    # 模型输入的最后一条必须是语言约束：位置比措辞更关键。
+    # 模型输入的最后一条必须仍是语言约束：位置比措辞更关键。
     assert model.seen[-1]["role"] == "system"
     assert model.seen[-1]["content"] == LANGUAGE_HINT
+    # 安全约束紧邻其后（倒数第二）：它原先只写在 messages[0]——整份上下文里权威性最低的位置。
+    assert model.seen[-2]["role"] == "system"
+    assert model.seen[-2]["content"] == SAFETY_HINT
 
 
 async def test_model_call_limit_stops_loop(services):

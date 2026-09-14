@@ -2,6 +2,7 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
+import pytest
 from sqlalchemy import text
 
 from mini_agent.config import load_config
@@ -192,5 +193,27 @@ async def test_add_trace_returns_id_and_supports_parent_chain(tmp_path: Path):
         trace = await store.list_trace(run["id"])
         assert [item["event_type"] for item in trace] == ["run.started", "model.started", "tool.started"]
         assert trace[2]["payload"]["parent_id"] == model_started
+    finally:
+        await store.close()
+
+
+async def test_add_message_rejects_roles_outside_the_whitelist(tmp_path: Path):
+    """角色白名单：model.py 是把 messages 原样透传给上游的（没有任何二次过滤），
+
+    所以"能不能落进一条 role=system 的消息"只能在这一层挡住。当前所有写入都出自 runtime、
+    取值本身不会越界；这道校验保护的是将来可能出现的"导入对话""用户可写消息"之类的接口——
+    一旦漏掉，role 就会被直接送进模型请求，等于让用户自己给自己提权。
+    """
+    db_path = tmp_path / "state.db"
+    migrate_database(db_path)
+    store = Store(db_path)
+    await store.init()
+    try:
+        session_id = await store.create_session()
+        for role in ("system", "developer", "USER", ""):
+            with pytest.raises(ValueError):
+                await store.add_message(session_id, None, role, {"content": "x"})
+        # 白名单内的角色正常写入；匹配必须大小写敏感，"USER" 不是 "user" 的等价写法。
+        assert await store.add_message(session_id, None, "user", {"content": "ok"}) == 1
     finally:
         await store.close()
