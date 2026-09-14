@@ -12,7 +12,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   AlertCircle, Bot, BrainCircuit, CheckCircle2, ChevronDown, CircleDashed,
-  ListTree, Menu, MessageSquare, Plus, Send, Square, Trash2, Wrench, X,
+  ListTree, Menu, MessageSquare, Plus, RefreshCw, Scissors, Send, Square, Trash2, Wrench, X,
 } from 'lucide-react'
 
 // —— 1. 类型与常量 ——
@@ -181,6 +181,8 @@ const tracePresentation = (item: TraceItem) => {
   const payload = item.payload
   const duration = typeof payload.duration_ms === 'number' ? `${Math.round(payload.duration_ms)} 毫秒` : ''
   const iteration = payload.iteration ? `第 ${payload.iteration} 轮` : ''
+  // 裁剪事件才有 token 数值：两个字段都齐全才拼成备注，避免出现"约 undefined / undefined tokens"。
+  const tokens = typeof payload.estimated_tokens === 'number' && typeof payload.input_budget === 'number' ? `约 ${payload.estimated_tokens} / ${payload.input_budget} tokens` : ''
   switch (item.event_type) {
     case 'run.started': return { icon: CircleDashed, tone: 'active', title: '开始运行', description: '已接收用户消息，Agent 开始处理。', meta: '' }
     case 'model.started': return { icon: BrainCircuit, tone: 'active', title: payload.phase === 'summary' ? '压缩上下文' : '请求模型', description: `${iteration || '当前轮次'}，模型正在判断直接回答还是调用工具。`, meta: `第 ${payload.attempt || 1} 次尝试` }
@@ -188,12 +190,15 @@ const tracePresentation = (item: TraceItem) => {
     case 'model.retry': return { icon: AlertCircle, tone: 'warning', title: '模型请求重试', description: `请求未成功，正在自动重试。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: duration }
     case 'model.failed': return { icon: AlertCircle, tone: 'danger', title: '模型请求失败', description: `模型服务请求失败。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: duration }
     case 'model.invalid': return { icon: AlertCircle, tone: 'warning', title: '模型响应格式修复', description: `响应格式不符合协议，Agent 将要求模型重新返回。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: iteration }
+    case 'model.repair': return { icon: RefreshCw, tone: 'warning', title: '重发请求以修复格式', description: payload.minimal_context ? '已改用最小上下文重发：同一上下文会复现相同错误。' : '保持当前上下文原样重发一次。', meta: `第 ${payload.repairs || 1} 次修复` }
     case 'assistant.delta': return { icon: Send, tone: 'active', title: payload.complete ? '回答输出完成' : '输出回答片段', description: 'Agent 正在把最终回答分片推送给前端。', meta: `${String(payload.content ?? '').length} 字` }
     case 'tool.started': return { icon: Wrench, tone: 'active', title: `调用工具：${TOOL_NAMES[String(payload.name)] || payload.name}`, description: '模型选择了工具，正在执行并等待结果。', meta: iteration }
     case 'tool.finished': return { icon: payload.ok ? CheckCircle2 : AlertCircle, tone: payload.ok ? 'success' : 'danger', title: `工具${payload.ok ? '执行完成' : '执行失败'}：${TOOL_NAMES[String(payload.name)] || payload.name}`, description: payload.ok ? '工具结果已写入上下文，Agent 将继续判断下一步。' : `工具返回错误：${detailMessage(payload.error_code)}`, meta: duration }
     case 'tool.reused': return { icon: Wrench, tone: 'success', title: `复用工具结果：${TOOL_NAMES[String(payload.name)] || payload.name}`, description: '检测到相同调用，直接使用已保存的结果。', meta: iteration }
     case 'context.compacted': return { icon: ListTree, tone: 'success', title: '历史上下文已压缩', description: '较早的对话已整理为摘要，为后续问答释放上下文空间。', meta: `压缩至消息 ${payload.covered_through_seq}` }
     case 'context.compaction_failed': return { icon: AlertCircle, tone: 'warning', title: '上下文压缩未完成', description: '本次摘要生成失败，Agent 已使用可用历史继续运行。', meta: String(payload.code || '') }
+    case 'context.trimmed': return { icon: Scissors, tone: 'warning', title: '上下文超出上限已裁剪', description: '为装下本次请求，较早且尚未摘要的对话被临时省略，模型可能记不起更早的内容。', meta: tokens }
+    case 'message.write_failed': return { icon: AlertCircle, tone: 'danger', title: '回答保存失败', description: '最终回答未能写入消息表，会话记录可能不完整；运行记录里仍保留着完整回答。', meta: `消息 #${payload.seq}` }
     case 'run.finished': {
       const status = String(payload.status || '')
       const success = status === 'completed'
