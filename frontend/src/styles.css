@@ -98,6 +98,8 @@ header p { margin: 3px 0 0; color: var(--subtle); font-size: 11px; overflow: hid
 .running span:nth-child(2) { animation-delay: .15s; }
 .running span:nth-child(3) { animation-delay: .3s; }
 .running em { margin-left: 6px; font-style: normal; }
+/* 过程性提示（上游重试中）：中性蓝色，与红色错误条区分开——它不代表失败。 */
+.running .notice { margin-left: 8px; padding: 2px 8px; border-radius: 999px; background: #eef4ff; color: #3565a9; font-style: normal; font-size: 12px; }
 
 /* —— 执行日志视图：运行分组与步骤时间线 —— */
 .trace-page { min-height: 0; overflow: auto; padding: 32px max(28px, calc((100% - 880px) / 2)) 60px; }

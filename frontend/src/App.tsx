@@ -58,6 +58,25 @@ const ERROR_MESSAGES: Record<string, string> = {
   tool_error: '工具执行失败',
   unknown_tool: '未找到指定工具',
 }
+
+/**
+ * 判断推理与正文是否在承载同一段文字。
+ *
+ * 模型对工具轮常把决策说明同时写进 reasoning_content 与 content。流式期间两者是同一段话的
+ * 不同进度，且尾部会各自发散（实测公共前缀占较短一方 80% 以上，但不一定严格互为前缀），
+ * 所以用"公共前缀占比"判定而不是全等或严格前缀——后两者在流式途中都会漏判。
+ * 比较前去掉空白，避免换行差异影响判定。
+ */
+const sharesText = (a?: string, b?: string): boolean => {
+  const left = (a || '').replace(/\s+/g, '')
+  const right = (b || '').replace(/\s+/g, '')
+  const shorter = Math.min(left.length, right.length)
+  if (shorter < 12) return false
+  if (left === right) return true
+  let same = 0
+  while (same < shorter && left[same] === right[same]) same += 1
+  return same >= shorter * .8
+}
 // 工具的英文标识 → 中文展示名（用于执行日志中的“调用工具：xxx”）。
 const TOOL_NAMES: Record<string, string> = {
   calculator: '计算器', search: '搜索', weather: '天气', todo: '待办',
@@ -250,6 +269,8 @@ export default function App() {
     try { return localStorage.getItem('mini-agent:sessions-collapsed') === '1' } catch { return false }
   })
   const [error, setError] = useState('')
+  // 过程性提示（目前只有"上游无响应，正在重试"）：它不是错误，只解释"为什么一直没有输出"。
+  const [notice, setNotice] = useState('')
   const [clock, setClock] = useState(() => Date.now())
   const endRef = useRef<HTMLDivElement>(null)
   const selectedRef = useRef(selected)
@@ -270,7 +291,7 @@ export default function App() {
   // 以便刷新页面后仍停留在同一个会话。
   const selectSession = (id: string) => {
     eventSourceRef.current?.close(); eventSourceRef.current = null; selectedRef.current = id; runStartedAt.current = null
-    setSelected(id); setSidebar(false); setMessages([]); setRun(null); setRuns([]); setTrace([]); setExpandedTraceRun(null); setView('chat'); setError('')
+    setSelected(id); setSidebar(false); setMessages([]); setRun(null); setRuns([]); setTrace([]); setExpandedTraceRun(null); setView('chat'); setError(''); setNotice('')
     const url = new URL(location.href)
     if (id) url.searchParams.set('session', id)
     else url.searchParams.delete('session')
@@ -321,6 +342,8 @@ export default function App() {
       if (selectedRef.current !== sessionId) { source.close(); return }
       const snapshot = JSON.parse((event as MessageEvent).data) as Run
       setRun(snapshot)
+      // 运行已经结束（无论成败）就不该再挂着"正在重试"了。
+      if (TERMINAL_STATUSES.has(snapshot.status)) setNotice('')
       if (view === 'trace') loadTrace(runId, sessionId).catch(e => setError(e.message))
       if (TERMINAL_STATUSES.has(snapshot.status)) {
         source.close()
@@ -334,17 +357,34 @@ export default function App() {
     })
     source.addEventListener('message', event => {
       if (selectedRef.current !== sessionId) return
-      const payload = JSON.parse((event as MessageEvent).data) as { seq?: number; content?: string; thinking?: string }
+      const payload = JSON.parse((event as MessageEvent).data) as { seq?: number; content?: string; thinking?: string; tool_calls?: unknown[] }
       const seq = payload.seq
       // 只更新服务端指明的那条消息；不做“最后一条助手消息”的猜测，否则会把上一条回答覆盖掉。
       if (typeof seq !== 'number') return
+      // 又有增量流出，说明上游恢复了：重试提示的使命结束。
+      setNotice('')
       const content = payload.content || ''
       const thinking = payload.thinking || ''
+      // tool_calls 只在本轮确定为工具调用时才随增量下发：收到就要立刻落进状态，
+      // 否则这一轮的决策说明会一直被当成回答渲染（与思考面板内容重复），
+      // 且"调用了 N 个工具"要等整轮结束才出现。
+      const toolCalls = payload.tool_calls?.length ? payload.tool_calls : undefined
       setMessages(current => {
         const index = current.findIndex(item => item.seq === seq)
-        if (index < 0) return [...current, { role: 'assistant', content, thinking, seq }]
-        return current.map((item, itemIndex) => itemIndex === index ? { ...item, content, thinking: thinking || item.thinking } : item)
+        if (index < 0) return [...current, { role: 'assistant', content, thinking, seq, tool_calls: toolCalls }]
+        return current.map((item, itemIndex) => itemIndex === index
+          ? { ...item, content, thinking: thinking || item.thinking, tool_calls: toolCalls ?? item.tool_calls }
+          : item)
       })
+    })
+    // 过程性提示：上游挂起时数据库没有任何变化，快照与增量都推不出内容，
+    // 没有这条提示界面就只是在"转圈"，看不出是在重试还是卡死。
+    source.addEventListener('notice', event => {
+      if (selectedRef.current !== sessionId) return
+      const payload = JSON.parse((event as MessageEvent).data) as { code?: string; attempt?: number; delay_ms?: number }
+      if (payload.code !== 'model_retry') return
+      const seconds = Math.max(1, Math.round((payload.delay_ms ?? 0) / 1000))
+      setNotice(`上游未响应，${seconds} 秒后自动重试（第 ${payload.attempt ?? 2} 次尝试）`)
     })
     source.addEventListener('discard', event => {
       if (selectedRef.current !== sessionId) return
@@ -479,7 +519,12 @@ export default function App() {
             const toolCalls = message.tool_calls
             const isToolCall = !!(toolCalls && toolCalls.length)
             const thinking = message.thinking || (isToolCall ? (message.content || '') : '')
-            const answer = isToolCall ? '' : (message.content || '')
+            // 模型有时把同一段文字同时写进推理与正文（工具轮的决策说明就是这样）。本轮拿到
+            // tool_calls 之前，正文会被当作回答渲染，于是同一段话在思考面板和气泡里各出现一遍。
+            // 抑制只在运行进行中生效：运行一结束就先整表刷新（工具轮会带上 tool_calls 变成
+            // "调用了 N 个工具"），终答也照常显示——宁可显示得重复，也不能把回答藏起来。
+            const duplicated = sharesText(message.content, message.thinking)
+            const answer = isToolCall || (duplicated && busy) ? '' : (message.content || '')
             const toolCount = toolCalls?.length ?? 0
             return <article key={`${message.seq}-${message.role}`} className={`message ${message.role}`}>
               <div className="role">{message.role === 'user' ? '你' : 'Agent'}</div>
@@ -489,7 +534,7 @@ export default function App() {
             </article>
           })
         })()}
-        {busy && <div className="running"><span/><span/><span/><em>{run?.status === 'cancel_requested' ? '正在停止' : '正在处理'}</em></div>}
+        {busy && <div className="running"><span/><span/><span/><em>{run?.status === 'cancel_requested' ? '正在停止' : '正在处理'}</em>{notice && <i className="notice">{notice}</i>}</div>}
         <div ref={endRef}/>
       </section>}
       {/* 执行日志视图：按运行轮次分组的步骤时间线 */}
