@@ -26,6 +26,24 @@ test = ["pytest>=8", "pytest-asyncio>=0.24", "playwright>=1.48"]
 asyncio_mode = "auto"
 pythonpath = ["backend"]
 
+[tool.ruff]
+# 只做静态检查，不接管格式化：`ruff format` 会重排现有的紧凑写法与行内中文注释，
+# 需要单独评估后再开。
+target-version = "py311"
+
+[tool.ruff.lint]
+# 显式写出采用的规则集，避免"依赖默认值"变成隐性约定：
+#   E4 import 位置 · E7 语句写法 · E9 语法错误 · F pyflakes（未使用导入 / 未定义名字）。
+# 未启用 E501（行长度）：storage.py 的表定义最长一行 653 字符、runtime.py 的 __init__
+# 签名也刻意写成单行，全量启用会一次产生 60+ 条告警、把真正的信号淹掉；要收拾它得先给
+# 这些定义做换行重构，属于独立的一批工作。
+select = ["E4", "E7", "E9", "F"]
+# E701/E702 有意关闭：全项目约 20 处使用 `if 条件: return x`、`elif …: value = …` 与
+# 分号分隔的紧凑写法，集中在 model.py 的参数解析与 tools.py 的算式求值这类纯函数中，
+# 是有意的可读性取舍而非疏漏。要统一成"一行一语句"属于独立的风格批，
+# 完成后把这两条从 ignore 中移除即可。
+ignore = ["E701", "E702"]
+
 [tool.setuptools]
 package-dir = {"" = "backend"}
 
