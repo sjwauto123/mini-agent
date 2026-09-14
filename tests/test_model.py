@@ -1,7 +1,16 @@
+import httpx
+import pytest
+
 from mini_agent.contracts import Final, Invalid, ToolCall
-from mini_agent.model import parse_response
+from mini_agent.errors import ModelServiceError
+from mini_agent.model import HttpModelClient, parse_response
 
 from .fakes import final, tool
+
+
+def mock_client(handler, mode: str = "native") -> HttpModelClient:
+    """构造一个不联网的 HttpModelClient：用 MockTransport 接管全部请求。"""
+    return HttpModelClient("https://example.invalid/v1/chat/completions", "test-model", "key", mode, transport=httpx.MockTransport(handler))
 
 
 def test_native_final_and_tool_call():
@@ -65,3 +74,29 @@ def test_json_accepts_fenced_object_and_flags_truncation():
     assert isinstance(parsed, Final) and parsed.answer == "好了"
     truncated = parse_response({"content": '{"action":"final","ans', "finish_reason": "length"}, "json")
     assert isinstance(truncated, Invalid) and truncated.code == "model_truncated"
+
+
+async def test_auth_and_request_failures_get_stable_codes():
+    """401/403 与 400 必须区分开：前者是密钥问题，后者是配置问题，不能都变成"未知失败"。"""
+    with pytest.raises(ModelServiceError) as unauthorized:
+        await mock_client(lambda _: httpx.Response(401, content=b"unauthorized")).complete([], [])
+    with pytest.raises(ModelServiceError) as rejected:
+        await mock_client(lambda _: httpx.Response(400, content=b"bad model")).complete([], [])
+    assert unauthorized.value.code == "model_auth_failed"
+    assert rejected.value.code == "model_request_invalid"
+
+
+async def test_retryable_status_still_raises_httpx_error():
+    """429/5xx 由运行时的有限重试处理，模型层不要把它们吞成"配置错误"。"""
+    with pytest.raises(httpx.HTTPStatusError):
+        await mock_client(lambda _: httpx.Response(429, content=b"slow down")).complete([], [])
+
+
+async def test_non_json_and_incomplete_body_are_protocol_errors():
+    """200 + 非 JSON 正文（例如被中间层换成 HTML 错误页）与结构缺失都属于协议错误。"""
+    with pytest.raises(ModelServiceError) as html:
+        await mock_client(lambda _: httpx.Response(200, content=b"<html>bad gateway</html>"), "json").complete([], [])
+    with pytest.raises(ModelServiceError) as shapeless:
+        await mock_client(lambda _: httpx.Response(200, json={"id": "x"}), "json").complete([], [])
+    assert html.value.code == "model_protocol_error"
+    assert shapeless.value.code == "model_protocol_error"

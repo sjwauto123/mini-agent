@@ -5,6 +5,7 @@ import re
 import httpx
 
 from mini_agent.contracts import ToolResult
+from mini_agent.errors import ModelServiceError
 from mini_agent.runtime import AgentRuntime
 from mini_agent.tools import ToolSpec
 
@@ -348,6 +349,73 @@ async def test_conflicting_reused_call_id_is_bounded(services):
     assert result.status == "failed"
     assert result.error["code"] == "model_protocol_error"
     assert len(model.calls) == 4
+
+
+class StreamingModel:
+    """只实现 stream 的假模型：验证"边收边写"的落库与收尾标记。"""
+
+    def __init__(self, chunks: list[str], answer: str) -> None:
+        self.chunks, self.answer = chunks, answer
+
+    async def stream(self, messages, tools, *, tool_choice="auto"):
+        for text in self.chunks:
+            yield {"type": "content", "text": text}
+        yield {"type": "done", "raw": final(self.answer)}
+
+
+async def test_streamed_answer_is_persisted_once_and_not_marked_incomplete(services):
+    """流式落库结束后库里只有一条完整回答，且不残留 incomplete 标记。
+
+    incomplete 只在"流到一半"的中间态为真，它是给中断恢复用的：如果收尾时忘了摘掉，
+    接口层和后续上下文都会把正常回答当成没写完的内容。
+    """
+    model = StreamingModel(["你好", "，世界"], "你好，世界")
+    runtime, store, session_id = await make_runtime(services, model)
+    run, _ = await runtime.submit(session_id, "打个招呼")
+    result = await runtime.execute(run["id"])
+    assert result.status == "completed" and result.answer == "你好，世界"
+    assert await store.list_messages(session_id) == [
+        {"role": "user", "seq": 1, "run_id": run["id"], "content": "打个招呼"},
+        {"role": "assistant", "seq": 2, "run_id": run["id"], "content": "你好，世界"},
+    ]
+
+
+async def test_cancel_discards_partial_streamed_message(services):
+    """流到一半被取消时半截回答必须撤回：历史里只能留下一条"已停止"的交代。"""
+
+    class HangingStreamModel:
+        async def stream(self, messages, tools, *, tool_choice="auto"):
+            yield {"type": "content", "text": "这条回答还没写完"}
+            await asyncio.sleep(30)
+            yield {"type": "done", "raw": final("永远到不了这里")}
+
+    runtime, store, session_id = await make_runtime(services, HangingStreamModel())
+    run, _ = await runtime.submit(session_id, "给我一段长回答")
+    task = asyncio.create_task(runtime.execute(run["id"]))
+    await asyncio.sleep(.3)
+    assert await store.request_cancel(run["id"])
+    result = await asyncio.wait_for(task, timeout=3)
+    assert result.status == "cancelled"
+    messages = await store.list_messages(session_id)
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert messages[-1]["content"] == "已停止本次运行，已完成的工具操作仍然保留。"
+
+
+async def test_model_auth_failure_reports_stable_code_and_trace(services):
+    """鉴权失败属于配置问题：要给出稳定错误码、可读文案，并在 trace 里留下原因。"""
+
+    class UnauthorizedModel:
+        async def complete(self, messages, tools, *, tool_choice="auto"):
+            raise ModelServiceError("model_auth_failed", "HTTP 401")
+
+    runtime, store, session_id = await make_runtime(services, UnauthorizedModel())
+    run, _ = await runtime.submit(session_id, "hello")
+    result = await runtime.execute(run["id"])
+    assert result.status == "failed" and result.error["code"] == "model_auth_failed"
+    assert "密钥" in result.answer
+    trace = await store.list_trace(run["id"])
+    failed = [item for item in trace if item["event_type"] == "model.failed"]
+    assert failed and failed[-1]["payload"]["code"] == "model_auth_failed"
 
 
 def runtime_context(run_id: str, session_id: str):

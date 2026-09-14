@@ -17,6 +17,9 @@ async def test_registry_schema_and_duplicate(services):
     assert names == {"calculator", "todo", "search", "weather", "resource_read", "resource_search"}
     result = await registry.execute("calculator", {"bad": "x"}, ExecutionContext("r", "s"))
     assert not result.ok and result.error["code"] == "invalid_arguments"
+    # detail 只随工具结果进入模型上下文（前端不渲染 tool 消息），模型据此才能改对参数。
+    typed = await registry.execute("calculator", {"expression": 5}, ExecutionContext("r", "s"))
+    assert typed.error["detail"].startswith("expression")
     spec = registry.get("calculator")
     try:
         registry.register(spec)
