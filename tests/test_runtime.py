@@ -44,6 +44,30 @@ async def test_tool_loop_and_followup_context(services):
     assert any("1000" in json.dumps(message) for message in second_context)
 
 
+async def test_thinking_summary_and_private_reasoning_stay_separate(services):
+    """思考过程用决策摘要展示；思考模式的私有推理只按协议回传，不进界面、不进决策。"""
+    model = ScriptedModel([
+        tool("c1", "calculator", '{"expression":"1+1"}', content="先算一下。", reasoning="私有推理：这一步应该调用计算器。"),
+        final("答案是 2。", reasoning="私有推理：已经拿到计算结果，可以直接回答。"),
+    ])
+    runtime, store, session_id = await make_runtime(services, model)
+    run, _ = await runtime.submit(session_id, "1+1 等于几")
+    result = await runtime.execute(run["id"])
+    assert result.status == "completed"
+
+    messages = await store.list_messages(session_id)
+    tool_round = next(message for message in messages if message.get("tool_calls"))
+    final_round = messages[-1]
+    assert tool_round["content"] == "先算一下。"
+    assert final_round["thinking"] == "私有推理：已经拿到计算结果，可以直接回答。"
+    assert tool_round["reasoning_content"].startswith("私有推理：这一步应该调用计算器")
+
+    second_context = model.calls[1]["messages"]
+    echoed = next(message for message in second_context if message.get("tool_calls"))
+    assert echoed["reasoning_content"] == tool_round["reasoning_content"]
+    assert all("thinking" not in message for message in second_context)
+
+
 async def test_weather_then_todo(services):
     from datetime import date, timedelta
     tomorrow = (date.today() + timedelta(days=1)).isoformat()
@@ -84,6 +108,31 @@ async def test_protocol_repairs_are_bounded(services):
     assert len(model.calls) == 3
 
 
+async def test_blank_body_retries_with_minimal_context(services):
+    """模型在多轮历史下偶发返回空白正文时，应自动退到「只保留本轮消息」的最小上下文并恢复。"""
+    blank = {"choices": [{"finish_reason": "stop", "message": {"content": "        "}}]}
+    model = ScriptedModel([final("第一轮回答"), blank, final("恢复后的回答")])
+    runtime, store, session_id = await make_runtime(services, model)
+
+    first, _ = await runtime.submit(session_id, "第一个问题")
+    assert (await runtime.execute(first["id"])).status == "completed"
+
+    second, _ = await runtime.submit(session_id, "第二个问题")
+    result = await runtime.execute(second["id"])
+    assert result.status == "completed" and result.answer == "恢复后的回答"
+    assert len(model.calls) == 3
+
+    # 首次重试仍用完整上下文（带着第一轮历史），最后一次才退到最小上下文（只保留本轮消息）。
+    assert "第一轮回答" in json.dumps(model.calls[1]["messages"], ensure_ascii=False)
+    recovery = json.dumps(model.calls[2]["messages"], ensure_ascii=False)
+    assert "第一轮回答" not in recovery and "第一个问题" not in recovery
+    assert "第二个问题" in recovery
+
+    trace = await store.list_trace(second["id"])
+    repairs = [item for item in trace if item["event_type"] == "model.repair"]
+    assert repairs and repairs[-1]["payload"]["minimal_context"] is True
+
+
 async def test_model_unavailable_has_readable_error_and_trace(services):
     class UnavailableModel:
         async def complete(self, messages, tools, *, tool_choice="auto"):
@@ -100,6 +149,30 @@ async def test_model_unavailable_has_readable_error_and_trace(services):
     failed = [item for item in trace if item["event_type"] == "model.failed"]
     assert failed and failed[-1]["payload"]["code"] == "ConnectError"
     assert "simulated network failure" in failed[-1]["payload"]["detail"]
+
+
+async def test_protocol_level_transport_error_is_retried_not_unclassified(services):
+    """协议层传输错误（RemoteProtocolError）属于可重试故障，必须走重试与友好提示，不能变成未分类异常。"""
+
+    class FlakyModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tools, *, tool_choice="auto"):
+            self.calls += 1
+            raise httpx.RemoteProtocolError("server disconnected without response")
+
+    model = FlakyModel()
+    runtime, store, session_id = await make_runtime(services, model)
+    run, _ = await runtime.submit(session_id, "hello")
+    result = await runtime.execute(run["id"])
+    assert result.status == "failed"
+    assert result.error["code"] == "model_unavailable"
+    assert "模型服务暂时不可用" in result.answer
+    assert model.calls == 3
+    trace = await store.list_trace(run["id"])
+    failed = [item for item in trace if item["event_type"] == "model.failed"]
+    assert failed and failed[-1]["payload"]["code"] == "RemoteProtocolError"
 
 
 async def test_model_call_limit_stops_loop(services):

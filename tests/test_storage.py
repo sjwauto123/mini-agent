@@ -1,5 +1,8 @@
 import hashlib
+import sqlite3
 from pathlib import Path
+
+from sqlalchemy import text
 
 from mini_agent.config import load_config
 from mini_agent.storage import Store, migrate_database
@@ -44,6 +47,35 @@ async def test_init_marks_abandoned_run_interrupted(tmp_path: Path):
         assert (await second.list_messages(session_id))[0]["content"] == "hello"
     finally:
         await second.close()
+
+
+async def test_sqlite_uses_wal_and_survives_lingering_reader(tmp_path: Path):
+    """回归：客户端异常断开可能残留未释放的读事务，WAL 下不得阻塞写入。
+
+    此前使用回滚日志（journal_mode=delete）：SSE 流被取消时，SQLAlchemy 归还连接的
+    过程可能被一并取消，导致连接带着未释放的读事务泄漏。残留读者会让之后所有写入提交
+    持续报 "database is locked"，表现为创建会话接口长期 500。
+    切到 WAL 后读不再阻塞写，可以在残留读者存在时继续写入。
+    """
+    db_path = tmp_path / "state.db"
+    migrate_database(db_path)
+    store = Store(db_path)
+    reader: sqlite3.Connection | None = None
+    try:
+        assert await store.create_session("model-a")
+        async with store.engine.connect() as connection:
+            assert (await connection.execute(text("PRAGMA journal_mode"))).scalar() == "wal"
+        # 制造残留读事务，模拟异常断开后未释放的连接
+        reader = sqlite3.connect(str(db_path))
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM sessions").fetchone()
+        # 残留读者在场时，写入仍必须成功
+        assert await store.create_session("model-a")
+    finally:
+        if reader is not None:
+            reader.rollback()
+            reader.close()
+        await store.close()
 
 
 def test_runtime_ratios_are_configurable(tmp_path: Path):

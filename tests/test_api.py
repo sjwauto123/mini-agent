@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from pathlib import Path
 
@@ -64,6 +65,49 @@ def test_busy_cancel_and_terminal_sse_snapshot(tmp_path: Path):
         events = client.get(f"/api/runs/{run_id}/events")
         assert events.status_code == 200
         assert "event: snapshot" in events.text and '"status": "cancelled"' in events.text
+
+
+def test_sse_message_events_are_anchored_and_never_empty(tmp_path: Path):
+    """回归：运行刚开始时的空载荷会被前端当成流式目标，把上一条回答覆盖掉。
+
+    因此 message 事件必须带 seq（前端据此精确定位），且不允许推送空内容。
+    """
+
+    class DelayedModel:
+        async def complete(self, messages, tools, *, tool_choice="auto"):
+            await asyncio.sleep(.6)
+            return final("上海是中国最大的经济中心城市。", reasoning="可以直接回答。")
+
+    config = make_config(tmp_path)
+    migrate_database(tmp_path / "state.db")
+    with TestClient(create_app(config, {"test": DelayedModel()})) as client:
+        session_id = client.post("/api/sessions", json={"model_name": "test"}).json()["id"]
+        first = client.post(f"/api/sessions/{session_id}/runs", json={"message": "介绍北京"})
+        assert wait_for_terminal(client, first.json()["run_id"])["status"] == "completed"
+
+        second = client.post(f"/api/sessions/{session_id}/runs", json={"message": "再介绍上海"})
+        events = client.get(f"/api/runs/{second.json()['run_id']}/events")
+        assert events.status_code == 200
+
+        payloads = []
+        for line in events.text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                data = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and "content" in data:
+                payloads.append(data)
+
+        assert payloads, "运行过程中应当推送过 message 事件"
+        for payload in payloads:
+            assert isinstance(payload.get("seq"), int), f"message 事件必须带 seq：{payload}"
+            assert payload.get("content") or payload.get("thinking"), f"不允许推送空载荷：{payload}"
+
+        history = client.get(f"/api/sessions/{session_id}/messages").json()
+        previous_seq = next(item["seq"] for item in history if item["role"] == "assistant")
+        assert all(payload["seq"] > previous_seq for payload in payloads), "推送目标必须是本轮新回答"
 
 
 def test_different_sessions_run_independently(tmp_path: Path):

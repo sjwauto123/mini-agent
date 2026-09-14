@@ -13,9 +13,15 @@ class ScriptedModel:
         return self.responses.pop(0)
 
 
-def final(text: str) -> dict[str, Any]:
-    return {"choices": [{"finish_reason": "stop", "message": {"content": text}}]}
+def final(text: str, reasoning: str = "") -> dict[str, Any]:
+    message: dict[str, Any] = {"content": text}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    return {"choices": [{"finish_reason": "stop", "message": message}]}
 
 
-def tool(call_id: str, name: str, arguments: str, content: str | None = None) -> dict[str, Any]:
-    return {"choices": [{"finish_reason": "tool_calls", "message": {"content": content, "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}]}}]}
+def tool(call_id: str, name: str, arguments: str, content: str | None = None, reasoning: str = "") -> dict[str, Any]:
+    message: dict[str, Any] = {"content": content, "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}]}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    return {"choices": [{"finish_reason": "tool_calls", "message": message}]}
