@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import AppConfig, load_config
+from .events import RunEventBus
 from .model import HttpModelClient, ModelClient
 from .runtime import AgentRuntime
 from .storage import ResourceStore, Store, TodoStore
@@ -77,6 +78,9 @@ class AppServices:
         self.store = Store(config.data_dir / "state.db")
         self.resources = ResourceStore(self.store, config.data_dir / "resources")
         self.registry = build_registry(TodoStore(self.store), self.resources, config.tool_timeout)
+        # 运行事件总线：运行时把流式增量投给它、SSE 路由订阅它。两者由此解耦——
+        # 增量不再需要"先落库、再等接口层轮询发现"，推送粒度也就不再被轮询间隔锁死。
+        self.events = RunEventBus()
         # 记住进行中的任务，既避免被垃圾回收，也便于关闭时统一取消。
         self.tasks: dict[str, asyncio.Task[Any]] = {}
 
@@ -106,6 +110,7 @@ class AppServices:
             soft_context_ratio=config.soft_context_ratio,
             hard_context_ratio=config.hard_context_ratio,
             target_context_ratio=config.target_context_ratio,
+            events=self.events,
         )
 
     def launch(self, run_id: str) -> None:
@@ -268,32 +273,49 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
         async def events() -> AsyncIterator[str]:
             previous = ""
             previous_message = ""
-            while True:
-                # 每 200ms 拉一次数据库状态；只在内容变化时才推送，空闲时保持连接但不发多余数据。
-                run = await svc(request).store.get_run(run_id)
-                if not run:
-                    return
-                snapshot = json.dumps(run, ensure_ascii=False, sort_keys=True)
-                if snapshot != previous:
-                    yield f"event: snapshot\ndata: {snapshot}\n\n"
-                    previous = snapshot
-                messages = await svc(request).store.list_messages(run["session_id"])
-                assistant = next((item for item in reversed(messages) if item.get("run_id") == run_id and item.get("role") == "assistant"), None)
-                # 本次运行还没有助手消息时什么都不推，否则前端会把上一条回答误当成流式目标。
-                # 载荷带 seq，前端据此精确定位要更新的那条消息，不做“最后一条助手消息”的猜测。
-                # 工具轮的正文是决策说明，结束前不当作答案流推送；只推最终回答与决策摘要。
-                if assistant is not None:
-                    content = "" if assistant.get("tool_calls") else (assistant.get("content") or "")
-                    thinking = assistant.get("thinking") or ""
-                    if content or thinking:
-                        payload = json.dumps({"seq": assistant.get("seq"), "content": content, "thinking": thinking}, ensure_ascii=False)
-                        if payload != previous_message:
-                            yield f"event: message\ndata: {payload}\n\n"
-                            previous_message = payload
-                # 终态才收尾；否则继续轮询。
-                if run["status"] in TERMINAL:
-                    return
-                await asyncio.sleep(.2)
+            queue = svc(request).events.subscribe(run_id)
+            try:
+                while True:
+                    # 优先投递总线上的增量：它代表"运行时刚刚产出的内容"，只需一次内存传递，
+                    # 因此回答是逐字生长，而不是等下一次轮询才被看见。
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=.2)
+                    except asyncio.TimeoutError:
+                        event = None
+                    if event is not None:
+                        if event.get("type") == "delta":
+                            payload = json.dumps({"seq": event.get("seq"), "content": event.get("content") or "", "thinking": event.get("thinking") or ""}, ensure_ascii=False)
+                            if payload != previous_message:
+                                yield f"event: message\ndata: {payload}\n\n"
+                                previous_message = payload
+                        elif event.get("type") == "discard":
+                            # 这一轮被作废（协议非法，或重试要从头再流一遍）：让前端把该条消息撤掉。
+                            yield f"event: discard\ndata: {json.dumps({'seq': event.get('seq')}, ensure_ascii=False)}\n\n"
+                    # 增量之外再对一次数据库：运行状态快照与终态收尾始终以数据库为唯一真相。
+                    run = await svc(request).store.get_run(run_id)
+                    if not run:
+                        return
+                    snapshot = json.dumps(run, ensure_ascii=False, sort_keys=True)
+                    if snapshot != previous:
+                        yield f"event: snapshot\ndata: {snapshot}\n\n"
+                        previous = snapshot
+                    if run["status"] in TERMINAL:
+                        # 终态做一次权威推送：落库有节流，增量可能少了最后几片，数据库里的一定是完整内容。
+                        # 载荷带 seq，前端据此精确定位要更新的那条消息，不做“最后一条助手消息”的猜测。
+                        # 工具轮的正文是决策说明而非答案，这里照旧不当作回答推送。
+                        messages = await svc(request).store.list_messages(run["session_id"])
+                        assistant = next((item for item in reversed(messages) if item.get("run_id") == run_id and item.get("role") == "assistant"), None)
+                        if assistant is not None:
+                            content = "" if assistant.get("tool_calls") else (assistant.get("content") or "")
+                            thinking = assistant.get("thinking") or ""
+                            if content or thinking:
+                                payload = json.dumps({"seq": assistant.get("seq"), "content": content, "thinking": thinking}, ensure_ascii=False)
+                                if payload != previous_message:
+                                    yield f"event: message\ndata: {payload}\n\n"
+                        return
+            finally:
+                # 客户端断开（生成器被关闭）时必须退订，否则频道里会一直留着一个没人读的队列。
+                svc(request).events.unsubscribe(run_id, queue)
 
         # no-cache：SSE 必须禁掉中间层缓存，否则推送会被缓冲住。
         return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
