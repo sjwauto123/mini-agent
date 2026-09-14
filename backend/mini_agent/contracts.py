@@ -37,6 +37,7 @@ class ExecutionContext:
 @dataclass
 class Final:
     answer: str
+    decision_summary: str = ""
 
 @dataclass
 class ToolCall:
@@ -44,6 +45,8 @@ class ToolCall:
     name: str
     arguments: dict[str, Any]
     decision_summary: str = ""
+    # 服务商思考模式返回的私有推理字段：只用于按协议回传给模型，不进入界面展示，也不作为决策依据。
+    reasoning_content: str = ""
 
 @dataclass
 class Invalid:
