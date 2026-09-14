@@ -1,88 +1,62 @@
-"""HTTP 接口层：FastAPI 应用装配与全部 REST/SSE 路由。
+"""HTTP 接口层：FastAPI 应用装配与公开符号的再导出。
 
 分工：
 - ``AppServices`` 持有存储、工具注册表与运行时这些单例，并负责把"运行"丢到后台任务；
-- ``create_app`` 完成装配（含单实例锁、静态前端托管）并声明路由；
-- 路由只做"校验参数 → 调用领域对象 → 映射错误码"，业务逻辑都在 runtime/storage 里。
+- ``routers`` 包按资源拆分路由，每个模块只做"校验参数 → 调用领域对象 → 映射错误码"，
+  业务逻辑都在 runtime/storage 里；
+- ``create_app`` 完成装配（单实例锁、中间件、路由登记、静态前端托管）。
 
 错误约定：对外一律返回 ``{"code": ..., "message": ...}``，其中 ``code`` 是稳定标识（来自
 ``errors`` 模块，前端据此展示本地化文案），``message`` 只是兜底。异常到错误码的转换统一走
 ``error_code_of``，本层不再自己拆字符串——那样会让同一个失败在不同层得出不同的码。
+
+历史兼容：``error_detail`` / ``public_run`` / ``_submission_status`` / 请求体模型等原先定义在
+本模块，拆分后搬到 ``routers.common``，这里原样再导出，既有调用方（含测试）无需改动。
 """
 import asyncio
-import json
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import portalocker
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
 from .config import AppConfig, load_config
-from .errors import KNOWN_CODES, SUBMIT_HTTP_STATUS, answer_for, error_code_of
 from .events import RunEventBus
 from .model import HttpModelClient, ModelClient
+from .routers import ALL_ROUTERS
+from .routers.common import (
+    INTERNAL_RUN_FIELDS,
+    TERMINAL,
+    ResourceCreate,
+    RunCreate,
+    SessionCreate,
+    SessionUpdate,
+    error_detail,
+    public_run,
+    submission_status as _submission_status,
+)
 from .runtime import AgentRuntime
 from .storage import ResourceStore, Store, TodoStore
 from .tools import build_registry
 
-# 终态集合：运行落到这些状态后，SSE 就可以收尾、前端可以释放输入框。
-TERMINAL = {"completed", "failed", "cancelled", "limit_reached", "interrupted"}
-# 运行记录里不对外暴露的服务端字段：哈希与幂等键只用于内部去重。
-INTERNAL_RUN_FIELDS = frozenset({"input_hash", "request_key"})
-
-logger = logging.getLogger(__name__)
-
-
-def error_detail(code: str) -> dict[str, str]:
-    """构造统一的错误响应体。文案取自 errors 模块，本层不再维护第二份表。"""
-    return {"code": code, "message": answer_for(code, "请求处理失败，请稍后重试。")}
-
-
-def _submission_status(code: str) -> int:
-    """提交运行时：错误码 → HTTP 状态。
-
-    未收录的码说明这是未预期的内部失败，按 500 上报——不能把服务端 bug 说成用户输入有问题；
-    已收录但没特别约定状态的（缺消息、资源过大等）按请求内容问题处理，回 400。
-    """
-    status = SUBMIT_HTTP_STATUS.get(code)
-    if status is not None:
-        return status
-    return 400 if code in KNOWN_CODES else 500
-
-
-def public_run(run: dict[str, Any] | None) -> dict[str, Any] | None:
-    """剔除服务端内部字段后再把运行记录交给客户端。"""
-    if run is None:
-        return None
-    return {key: value for key, value in run.items() if key not in INTERNAL_RUN_FIELDS}
-
-
-class SessionCreate(BaseModel):
-    model_name: str
-    timezone: str = Field(default="Asia/Shanghai", min_length=1, max_length=128)
-
-
-class SessionUpdate(BaseModel):
-    model_name: str
-
-
-class RunCreate(BaseModel):
-    # max_length 放宽到 10MB：超长消息由运行时转存为资源，而不是在这里被拒。
-    message: str = Field(min_length=1, max_length=10_485_760)
-    request_key: str | None = Field(default=None, max_length=128)
-
-
-class ResourceCreate(BaseModel):
-    content: str
-    kind: str = Field(default="text", pattern="^(text|json)$")
+__all__ = [
+    "AppServices",
+    "INTERNAL_RUN_FIELDS",
+    "ResourceCreate",
+    "RunCreate",
+    "SessionCreate",
+    "SessionUpdate",
+    "TERMINAL",
+    "_submission_status",
+    "app",
+    "create_app",
+    "error_detail",
+    "public_run",
+]
 
 
 class AppServices:
@@ -176,223 +150,9 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
     # 只接受本机主机名，避免被当成对外服务使用时出现 Host 头攻击。
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
 
-    def svc(request: Request) -> AppServices:
-        return request.app.state.services
-
-    @app.get("/api/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
-
-    @app.get("/api/models")
-    async def model_list(request: Request) -> list[dict[str, Any]]:
-        # 不返回 endpoint / api_key_env，避免把服务端配置暴露给浏览器。
-        return [{
-            "name": item.name,
-            "model": item.model,
-            "mode": item.mode,
-            "context_window": item.context_window
-        } for item in svc(request).config.models.values()]
-
-    @app.post("/api/sessions", status_code=201)
-    async def session_create(body: SessionCreate, request: Request) -> dict[str, Any]:
-        if body.model_name not in svc(request).config.models:
-            raise HTTPException(400, detail=error_detail("model_not_configured"))
-        # 时区字符串由客户端提供，先验证再落库，否则后续算"今天"时会炸。
-        try:
-            ZoneInfo(body.timezone)
-        except (ZoneInfoNotFoundError, ValueError):
-            raise HTTPException(400, detail=error_detail("timezone_invalid"))
-        session_id = await svc(request).store.create_session(body.model_name, body.timezone)
-        return {"id": session_id, "model_name": body.model_name, "timezone": body.timezone, "title": None}
-
-    @app.get("/api/sessions")
-    async def session_list(request: Request) -> list[dict[str, Any]]:
-        return await svc(request).store.list_sessions()
-
-    @app.delete("/api/sessions/{session_id}")
-    async def session_delete(session_id: str, request: Request) -> dict[str, Any]:
-        if not await svc(request).store.get_session(session_id):
-            raise HTTPException(404, detail=error_detail("session_not_found"))
-        # 忙碌判定必须排在删除动作之前：被拒绝的请求不能留下任何副作用。
-        # 数据行的删除在一个事务里完成（含资源索引，见 Store.delete_session），
-        # 磁盘文件只能在事务提交之后清理——反过来会留下"有记录、无文件"的不可读资源。
-        purged = await svc(request).store.delete_session(session_id)
-        if purged is None:
-            raise HTTPException(409, detail=error_detail("session_busy"))
-        await svc(request).resources.purge_files(purged)
-        return {"id": session_id, "deleted": True}
-
-    @app.patch("/api/sessions/{session_id}")
-    async def session_update(session_id: str, body: SessionUpdate, request: Request) -> dict[str, Any]:
-        if body.model_name not in svc(request).config.models:
-            raise HTTPException(400, detail=error_detail("model_not_configured"))
-        # 这个接口没有副作用，所以"不存在"与"忙碌"可以分开报：前者 404、后者 409，
-        # 客户端不必靠猜来区分两种完全不同的处置方式。
-        if not await svc(request).store.get_session(session_id):
-            raise HTTPException(404, detail=error_detail("session_not_found"))
-        if not await svc(request).store.set_session_model(session_id, body.model_name):
-            raise HTTPException(409, detail=error_detail("session_busy"))
-        return {"id": session_id, "model_name": body.model_name}
-
-    @app.get("/api/sessions/{session_id}/messages")
-    async def message_list(session_id: str, request: Request) -> list[dict[str, Any]]:
-        if not await svc(request).store.get_session(session_id):
-            raise HTTPException(404, detail=error_detail("session_not_found"))
-        return await svc(request).store.list_messages(session_id)
-
-    @app.post("/api/sessions/{session_id}/runs", status_code=202)
-    async def run_create(session_id: str, body: RunCreate, request: Request) -> dict[str, Any]:
-        """提交一条消息。返回 202 —— 此时只是"受理"，回答要靠 SSE 或轮询获取。"""
-        try:
-            run, created = await svc(request).runtime.submit(session_id, body.message, body.request_key)
-        except Exception as exc:
-            # 归一化成稳定错误码后再决定状态码：同一个失败不能因为异常类型不同而时 404 时 409。
-            # 会话冲突 → 409；请求内容问题 → 400；服务端配置/依赖问题 → 503。
-            code = error_code_of(exc)
-            logger.warning("session %s run submission rejected: %s", session_id, code)
-            raise HTTPException(_submission_status(code), detail=error_detail(code))
-        # 幂等命中时不重复启动，避免同一条消息跑两遍。
-        if created:
-            svc(request).launch(run["id"])
-        return {"run_id": run["id"], "created": created, "status": run["status"]}
-
-    @app.get("/api/runs/{run_id}")
-    async def run_get(run_id: str, request: Request) -> dict[str, Any]:
-        run = public_run(await svc(request).store.get_run(run_id))
-        if not run:
-            raise HTTPException(404, detail=error_detail("run_not_found"))
-        return run
-
-    @app.get("/api/sessions/{session_id}/runs/latest")
-    async def latest_run(session_id: str, request: Request) -> dict[str, Any] | None:
-        # 前端刷新后用这个恢复"正在跑 / 已结束"，可能没有运行记录，因此允许返回 null。
-        if not await svc(request).store.get_session(session_id):
-            raise HTTPException(404, detail=error_detail("session_not_found"))
-        return public_run(await svc(request).store.latest_run(session_id))
-
-    @app.get("/api/sessions/{session_id}/runs")
-    async def run_list(session_id: str, request: Request) -> list[dict[str, Any]]:
-        if not await svc(request).store.get_session(session_id):
-            raise HTTPException(404, detail=error_detail("session_not_found"))
-        runs = await svc(request).store.list_runs(session_id)
-        return [public_run(run) or {} for run in runs]
-
-    @app.get("/api/sessions/{session_id}/trace")
-    async def session_trace(session_id: str, request: Request) -> list[dict[str, Any]]:
-        if not await svc(request).store.get_session(session_id):
-            raise HTTPException(404, detail=error_detail("session_not_found"))
-        return await svc(request).store.list_session_trace(session_id)
-
-    @app.post("/api/runs/{run_id}/cancel", status_code=202)
-    async def run_cancel(run_id: str, request: Request) -> dict[str, Any]:
-        # accepted=False 也可能是"已经结束了"，所以要先确认 run 是否存在才能报 404。
-        accepted = await svc(request).store.request_cancel(run_id)
-        if not accepted and not await svc(request).store.get_run(run_id):
-            raise HTTPException(404, detail=error_detail("run_not_found"))
-        return {"run_id": run_id, "accepted": accepted}
-
-    @app.get("/api/runs/{run_id}/trace")
-    async def trace_get(run_id: str, request: Request) -> list[dict[str, Any]]:
-        if not await svc(request).store.get_run(run_id):
-            raise HTTPException(404, detail=error_detail("run_not_found"))
-        return await svc(request).store.list_trace(run_id)
-
-    @app.get("/api/runs/{run_id}/events")
-    async def run_events(run_id: str, request: Request) -> StreamingResponse:
-        """以 SSE 推送运行状态与流式回答。"""
-        if not await svc(request).store.get_run(run_id):
-            raise HTTPException(404, detail=error_detail("run_not_found"))
-
-        async def events() -> AsyncIterator[str]:
-            previous = ""
-            previous_message = ""
-            queue = svc(request).events.subscribe(run_id)
-            try:
-                while True:
-                    # 优先投递总线上的增量：它代表"运行时刚刚产出的内容"，只需一次内存传递，
-                    # 因此回答是逐字生长，而不是等下一次轮询才被看见。
-                    try:
-                        event = await asyncio.wait_for(queue.get(), timeout=.2)
-                    except asyncio.TimeoutError:
-                        event = None
-                    if event is not None:
-                        if event.get("type") == "delta":
-                            message = {
-                                "seq": event.get("seq"),
-                                "content": event.get("content") or "",
-                                "thinking": event.get("thinking") or ""
-                            }
-                            # 工具轮在结束的那一刻就带上 tool_calls：前端据此立即改显示成
-                            # "调用了 N 个工具"，而不会继续把决策说明当回答渲染（那会与思考面板重复）。
-                            if event.get("tool_calls"):
-                                message["tool_calls"] = event["tool_calls"]
-                            payload = json.dumps(message, ensure_ascii=False)
-                            if payload != previous_message:
-                                yield f"event: message\ndata: {payload}\n\n"
-                                previous_message = payload
-                        elif event.get("type") == "discard":
-                            # 这一轮被作废（协议非法，或重试要从头再流一遍）：让前端把该条消息撤掉。
-                            yield (
-                                "event: discard\ndata: "
-                                f"{json.dumps({'seq': event.get('seq')}, ensure_ascii=False)}\n\n"
-                            )
-                        elif event.get("type") == "notice":
-                            # 过程性提示（如"上游无响应，正在重试"）：不改变任何数据，
-                            # 只是让长时间没有增量的沉默期在界面上有解释。
-                            notice = {key: value for key, value in event.items() if key != "type"}
-                            yield f"event: notice\ndata: {json.dumps(notice, ensure_ascii=False)}\n\n"
-                    # 增量之外再对一次数据库：运行状态快照与终态收尾始终以数据库为唯一真相。
-                    run = public_run(await svc(request).store.get_run(run_id))
-                    if not run:
-                        return
-                    snapshot = json.dumps(run, ensure_ascii=False, sort_keys=True)
-                    if snapshot != previous:
-                        yield f"event: snapshot\ndata: {snapshot}\n\n"
-                        previous = snapshot
-                    if run["status"] in TERMINAL:
-                        # 终态做一次权威推送：落库有节流，增量可能少了最后几片，数据库里的一定是完整内容。
-                        # 载荷带 seq，前端据此精确定位要更新的那条消息，不做“最后一条助手消息”的猜测。
-                        # 工具轮的正文是决策说明而非答案，这里照旧不当作回答推送。
-                        messages = await svc(request).store.list_messages(run["session_id"])
-                        assistant = next((
-                            item for item in reversed(messages)
-                            if item.get("run_id") == run_id and item.get("role") == "assistant"
-                        ), None)
-                        if assistant is not None:
-                            content = "" if assistant.get("tool_calls") else (assistant.get("content") or "")
-                            thinking = assistant.get("thinking") or ""
-                            if content or thinking:
-                                payload = json.dumps({
-                                    "seq": assistant.get("seq"),
-                                    "content": content,
-                                    "thinking": thinking
-                                }, ensure_ascii=False)
-                                if payload != previous_message:
-                                    yield f"event: message\ndata: {payload}\n\n"
-                        return
-            except Exception:
-                # 推送过程中出错时，客户端只会看到连接断开，所以原因必须留在服务端日志里；
-                # 运行状态本身已落库，前端重连或重新拉快照都能拿到终态，不需要在这里补发事件。
-                logger.exception("run %s event stream aborted", run_id)
-            finally:
-                # 客户端断开（生成器被关闭）时必须退订，否则频道里会一直留着一个没人读的队列。
-                svc(request).events.unsubscribe(run_id, queue)
-
-        # no-cache：SSE 必须禁掉中间层缓存，否则推送会被缓冲住。
-        return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
-
-    @app.post("/api/sessions/{session_id}/resources", status_code=201)
-    async def resource_create(session_id: str, body: ResourceCreate, request: Request) -> dict[str, Any]:
-        if not await svc(request).store.get_session(session_id):
-            raise HTTPException(404, detail=error_detail("session_not_found"))
-        try:
-            resource_id = await svc(request).resources.save(session_id, body.content, body.kind)
-        except ValueError as exc:
-            # 归一化出错误码再决定状态码：超大资源用 413，其余（如 kind 非法）用 400。
-            code = error_code_of(exc)
-            status_code = 413 if code == "resource_too_large" else 400
-            raise HTTPException(status_code, detail=error_detail(code))
-        return {"resource_id": resource_id, "kind": body.kind, "size": len(body.content.encode("utf-8"))}
+    # 路由登记：各模块只声明自己的路径，装配顺序（先 API、后静态托管）由这里统一决定。
+    for router in ALL_ROUTERS:
+        app.include_router(router)
 
     # 生产式运行：把前端构建产物挂到根路径。开发时目录不存在，就只提供 API。
     frontend_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
