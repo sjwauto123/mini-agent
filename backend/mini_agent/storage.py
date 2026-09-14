@@ -171,15 +171,43 @@ class Store:
         async with self.engine.begin() as conn:
             return await write(conn)
 
-    async def update_message_content(self, session_id: str, seq: int, content: str) -> bool:
-        """就地更新某条助手消息的正文（保留其余字段）。"""
-        async with self.engine.begin() as conn:
+    async def update_message_fields(self, session_id: str, seq: int, fields: dict[str, Any], connection: Any = None) -> bool:
+        """按字段合并更新某条助手消息（保留未提到的字段）。
+
+        流式输出需要"同一条消息被反复续写"：正文与思考过程分别增长，工具轮还要往同一条消息上补
+        ``tool_calls``。用合并而不是整条替换，才能让这几路写入互不覆盖。
+        """
+        async def write(conn: Any) -> bool:
             existing = (await conn.execute(select(messages.c.payload).where(messages.c.session_id == session_id, messages.c.seq == seq, messages.c.role == "assistant"))).first()
             if not existing:
                 return False
             current = json.loads(existing[0]) if existing[0] else {}
-            current["content"] = content
+            current.update(fields)
+            # 空值代表"这一路还没有内容"：直接删掉字段而不是留空值，
+            # 否则界面与测试都会看到一堆无意义的空字段。
+            for key, value in fields.items():
+                if not value:
+                    current.pop(key, None)
             result = await conn.execute(update(messages).where(messages.c.session_id == session_id, messages.c.seq == seq, messages.c.role == "assistant").values(payload=json.dumps(current, ensure_ascii=False)))
+            return bool(result.rowcount)
+        if connection is not None:
+            return await write(connection)
+        async with self.engine.begin() as conn:
+            return await write(conn)
+
+    async def update_message_content(self, session_id: str, seq: int, content: str) -> bool:
+        """就地更新某条助手消息的正文（保留其余字段）。"""
+        return await self.update_message_fields(session_id, seq, {"content": content})
+
+    async def delete_message(self, session_id: str, seq: int) -> bool:
+        """删除一条消息。
+
+        流式输出是"先写后判"：内容边收边落库，等这一轮结束才知道模型给的是不是合法响应。
+        判定为非法（或重试要从头再流一遍）时，必须把已经写出去的那半句撤回，
+        否则界面上会留下一条幽灵回答。
+        """
+        async with self.engine.begin() as conn:
+            result = await conn.execute(delete(messages).where(messages.c.session_id == session_id, messages.c.seq == seq))
             return bool(result.rowcount)
 
     async def list_messages(self, session_id: str) -> list[dict[str, Any]]:

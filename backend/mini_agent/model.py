@@ -160,3 +160,77 @@ class HttpModelClient:
             "finish_reason": choice.get("finish_reason"),
             "usage": data.get("usage"),
         }
+
+    async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, tool_choice: str = "auto") -> AsyncIterator[dict[str, Any]]:
+        """流式调用模型：逐块产出增量，最后产出一份与 ``complete()`` 同构的完整响应。
+
+        产出三类 chunk：
+
+        - ``{"type": "reasoning", "text": ...}`` 私有推理增量（``reasoning_content``），只用于界面展示；
+        - ``{"type": "content", "text": ...}`` 回答正文增量；
+        - ``{"type": "done", "raw": {...}}`` 拼装好的完整响应，交给 ``parse_response`` 做协议判定。
+
+        关键点：**协议判定仍然只做一次，并且只用最终拼装结果**。增量只是"边收边给前端看"，
+        真正决定"这是终答还是工具调用"的依旧是 ``parse_response``——否则流式会让协议判定分裂成两套逻辑。
+
+        ``tool_calls`` 在流式协议里是分片下发的（同一个 index 的 name/arguments 会在多个 chunk 里续接），
+        因此这里按 index 归并后再拼字符串，不能简单覆盖。
+        """
+        payload: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": True}
+        if self.mode == "native":
+            payload.update({"tools": tools, "tool_choice": tool_choice, "parallel_tool_calls": False})
+        else:
+            payload["response_format"] = {"type": "json_object"}
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        calls: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        usage: dict[str, Any] | None = None
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with client.stream("POST", self.endpoint, headers={"Authorization": f"Bearer {self.api_key}"}, json=payload) as response:
+                # 流式响应同样要先校验状态码，否则 4xx/5xx 会被当成"空流"静默走完。
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        # 上游偶发的心跳/注释行：跳过而不是让整次请求失败。
+                        continue
+                    if isinstance(chunk.get("usage"), dict):
+                        usage = chunk["usage"]
+                    for choice in chunk.get("choices") or []:
+                        finish_reason = choice.get("finish_reason") or finish_reason
+                        delta = choice.get("delta") or {}
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
+                            yield {"type": "reasoning", "text": reasoning}
+                        content = delta.get("content")
+                        if content:
+                            content_parts.append(content)
+                            yield {"type": "content", "text": content}
+                        for call in delta.get("tool_calls") or []:
+                            index = int(call.get("index") or 0)
+                            slot = calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            if call.get("id"):
+                                slot["id"] = call["id"]
+                            function = call.get("function") or {}
+                            # name 一般只在首个分片出现，arguments 则会被切成很多片续接。
+                            if function.get("name"):
+                                slot["function"]["name"] += function["name"]
+                            if function.get("arguments"):
+                                slot["function"]["arguments"] += function["arguments"]
+        message: dict[str, Any] = {"content": "".join(content_parts) or None, "reasoning_content": "".join(reasoning_parts)}
+        if calls:
+            message["tool_calls"] = [calls[index] for index in sorted(calls)]
+        if self.mode == "native":
+            yield {"type": "done", "raw": {"choices": [{"finish_reason": finish_reason, "message": message}], "usage": usage}}
+        else:
+            # JSON 模式摊平成与 complete() 一致的形态，parse_response 只认这一套字段。
+            yield {"type": "done", "raw": {"content": message["content"], "reasoning_content": message["reasoning_content"], "finish_reason": finish_reason, "usage": usage}}
+
