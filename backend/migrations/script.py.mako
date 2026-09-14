@@ -1,3 +1,5 @@
+## Mako 模板：`alembic revision` 生成新迁移脚本时使用。
+## 下面的 ${...} 会被 Alembic 替换成实际值；## 开头的行是模板注释，不会出现在生成结果里。
 """${message}
 
 Revision ID: ${up_revision}
