@@ -18,6 +18,33 @@ from uuid import uuid4
 import httpx
 
 from .contracts import Final, Invalid, ModelEvent, ToolCall
+from .errors import ModelServiceError
+
+# 值得重试的状态码：限流与服务端暂时故障。其余 4xx 属于配置或参数问题，重试没有意义。
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+def _check_response(response: httpx.Response) -> None:
+    """校验状态码，把失败分成"可重试"与"不可重试且带稳定错误码"两类。
+
+    可重试的仍抛 httpx 异常，交给运行时的有限重试统一处理；鉴权与参数类失败归一成
+    ``ModelServiceError``，这样上层能给出可读原因，而不是笼统的"执行失败"。
+    """
+    if response.status_code in RETRYABLE_STATUS:
+        response.raise_for_status()
+    if response.is_error:
+        code = "model_auth_failed" if response.status_code in {401, 403} else "model_request_invalid"
+        raise ModelServiceError(code, f"HTTP {response.status_code}")
+
+def _decode_json(response: httpx.Response) -> dict[str, Any]:
+    """解析 JSON 响应；非 JSON 正文（例如被中间层换成了 HTML 错误页）归为协议错误。"""
+    try:
+        data = response.json()
+    except ValueError as exc:
+        # response.json() 内部抛 JSONDecodeError，它是 ValueError 的子类。
+        raise ModelServiceError("model_protocol_error", f"响应不是合法 JSON：{exc}") from exc
+    if not isinstance(data, dict):
+        raise ModelServiceError("model_protocol_error", "响应不是 JSON 对象")
+    return data
 
 class ModelClient(Protocol):
     """模型客户端的结构类型；测试里用假实现替换，无需继承。"""
@@ -135,24 +162,30 @@ def parse_response(raw: dict[str, Any], mode: str = "native") -> ModelEvent:
 
 class HttpModelClient:
     """基于 HTTP 的模型客户端，直接对接 OpenAI 兼容接口。"""
-    def __init__(self, endpoint: str, model: str, api_key: str, mode: str = "native", timeout: float = 60, max_tokens: int = 2048) -> None:
+    def __init__(self, endpoint: str, model: str, api_key: str, mode: str = "native", timeout: float = 60, max_tokens: int = 2048, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self.endpoint, self.model, self.api_key, self.mode, self.timeout, self.max_tokens = endpoint, model, api_key, mode, timeout, max_tokens
+        # transport 是给测试用的注入点（MockTransport）；生产路径保持 None，走 httpx 默认实现。
+        self.transport = transport
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, tool_choice: str = "auto") -> dict[str, Any]:
         payload: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens}
         # native 走工具协议；json 走 response_format 约束。两者不要混用。
         if self.mode == "native": payload.update({"tools": tools, "tool_choice": tool_choice, "parallel_tool_calls": False})
         else: payload["response_format"] = {"type": "json_object"}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
             response = await client.post(self.endpoint, headers={"Authorization": f"Bearer {self.api_key}"}, json=payload)
-            # 非 2xx 直接抛错，由运行时的传输层异常分支统一处理（含重试）。
-            response.raise_for_status()
-            data = response.json()
+            # 先判状态码再解析正文：4xx/5xx 的正文通常是错误说明，不是模型输出。
+            _check_response(response)
+            data = _decode_json(response)
         if self.mode == "native":
             # native 保留原始结构，parse_response 认识它的 choices/message 形态。
             return data
-        choice = data["choices"][0]
-        message = choice["message"]
+        # 逐一取字段而不是直接下标：服务商偶发返回结构不全时，也要给稳定错误码而不是 KeyError。
+        choices = data.get("choices") or []
+        choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise ModelServiceError("model_protocol_error", "响应缺少 choices[0].message")
         # finish_reason 与 usage 必须一并带出，否则无法判断「空白正文」是截断还是模型退化。
         return {
             "content": message.get("content"),
@@ -186,10 +219,10 @@ class HttpModelClient:
         calls: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
         usage: dict[str, Any] | None = None
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
             async with client.stream("POST", self.endpoint, headers={"Authorization": f"Bearer {self.api_key}"}, json=payload) as response:
                 # 流式响应同样要先校验状态码，否则 4xx/5xx 会被当成"空流"静默走完。
-                response.raise_for_status()
+                _check_response(response)
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue

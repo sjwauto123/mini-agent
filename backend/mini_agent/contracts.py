@@ -23,7 +23,12 @@ class RunRequest:
 
 @dataclass
 class ToolResult:
-    """工具执行结果。``ok=False`` 时错误细节放在 ``error``（含稳定错误码）。"""
+    """工具执行结果。``ok=False`` 时错误细节放在 ``error``（含稳定错误码）。
+
+    ``error`` 固定包含 ``code`` / ``message`` / ``outcome``（not_executed | failed | unknown）。
+    可额外带 ``detail``：只随工具结果进入模型上下文、供模型修正参数用，前端不渲染 tool 消息，
+    因此不会把内部报错暴露给用户。
+    """
     ok: bool
     data: Any = None
     error: dict[str, Any] | None = None

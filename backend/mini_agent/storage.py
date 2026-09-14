@@ -13,6 +13,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ from sqlalchemy import Column, ForeignKey, Integer, MetaData, String, Table, Tex
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from .contracts import ExecutionContext, ToolResult
+
+# 清理失败之类的"可继续但需要留痕"的情况走日志，不打断调用方。
+logger = logging.getLogger(__name__)
 
 # 表结构在这里以 Core 方式声明（不引入 ORM 映射），与实际 DDL 的权威来源是 migrations/。
 metadata = MetaData()
@@ -117,23 +121,34 @@ class Store:
         async with self.engine.begin() as conn:
             await conn.execute(update(sessions).where(sessions.c.id == session_id).values(title=title))
 
-    async def delete_session(self, session_id: str) -> bool:
-        """删除会话及其全部从属数据。返回 False 表示会话正在跑，拒绝删除。"""
+    async def delete_session(self, session_id: str) -> list[str] | None:
+        """删除会话及其全部从属数据，返回待清理的资源文件键。
+
+        返回 ``None`` 表示拒绝删除（会话正在运行），此时不留任何副作用。
+        忙碌判定与所有数据行的删除必须落在同一个事务里，否则"判定通过 → 删除失败"和
+        "判定拒绝 → 却已经删掉了别的东西"都无法回滚。
+        资源文件本身不能在这里删——事务还没提交，磁盘清理交给调用方拿到文件键之后做。
+        """
         async with self.engine.begin() as conn:
             # 有活跃运行时不允许删除，否则正在执行的 run 会写进已被清空的数据里。
             active = await conn.scalar(select(func.count()).select_from(runs).where(runs.c.session_id == session_id, runs.c.status.in_(["running", "cancel_requested"])))
             if active:
-                return False
-            # 删除顺序必须由"叶子"到"根"：先删引用 runs 的表，再删 messages/runs，最后删会话，
-            # 否则会被外键约束挡住。
+                return None
+            files = (await conn.execute(select(resources.c.file_key).where(resources.c.session_id == session_id))).fetchall()
+            # 删除顺序必须由"叶子"到"根"：先删引用 runs 的表，再删 messages/runs，
+            # 然后是直接引用会话的表，最后删会话，否则会被外键约束挡住。
             await conn.execute(delete(tool_calls).where(tool_calls.c.run_id.in_(select(runs.c.id).where(runs.c.session_id == session_id))))
             await conn.execute(delete(trace_events).where(trace_events.c.run_id.in_(select(runs.c.id).where(runs.c.session_id == session_id))))
             await conn.execute(delete(messages).where(messages.c.session_id == session_id))
             await conn.execute(delete(runs).where(runs.c.session_id == session_id))
             await conn.execute(delete(summaries).where(summaries.c.session_id == session_id))
             await conn.execute(delete(todos).where(todos.c.session_id == session_id))
+            await conn.execute(delete(resources).where(resources.c.session_id == session_id))
             result = await conn.execute(delete(sessions).where(sessions.c.id == session_id))
-            return bool(result.rowcount)
+            if not result.rowcount:
+                # 会话在判定之前就已经不存在：本次没有删除任何东西，按"拒绝"返回。
+                return None
+            return [file_key for (file_key,) in files]
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         # 按创建时间倒序：最新的会话排在最前面。
@@ -400,24 +415,37 @@ class ResourceStore:
                 await conn.execute(insert(resources).values(id=resource_id, session_id=session_id, kind=kind, file_key=file_key, size=len(data), created_at=utc_now()))
         except Exception:
             # 索引写失败就把刚落的文件删掉，避免出现"有文件没记录"的孤儿。
-            await asyncio.to_thread(final_path.unlink, missing_ok=True)
+            # 清理失败不能顶掉真正的失败原因：原异常必须照常抛出，否则报出来的是
+            # 文件删除错误，而真正的问题（索引写失败）反而被掩盖。
+            try:
+                await asyncio.to_thread(final_path.unlink, missing_ok=True)
+            except BaseException:
+                logger.warning("failed to remove orphaned resource file %s", file_key, exc_info=True)
             raise
         return resource_id
 
-    async def delete_for_session(self, session_id: str) -> int:
-        """删除会话关联的全部资源文件与索引，返回文件数。"""
-        rows = []
-        async with self.store.engine.connect() as conn:
-            rows = (await conn.execute(select(resources.c.file_key).where(resources.c.session_id == session_id))).fetchall()
-        # 先删文件：文件删不掉不影响数据库记录的清理（反之会留下孤儿文件）。
-        for (file_key,) in rows:
+    async def purge_files(self, file_keys: list[str]) -> int:
+        """删除给定的资源文件，返回处理过的文件数。
+
+        只碰磁盘、不碰数据库：调用方必须已经提交了资源索引的删除。顺序反过来
+        （先删文件再删索引）会在索引删除失败时留下"有记录、无文件"的不可读资源。
+
+        清理是"尽力而为"：索引已经删掉了，文件残留只是整洁问题，所以这里吞掉所有异常
+        （除取消信号外）——包括权限不足、句柄占用，以及平台删除防护抛出的 ``SystemExit``
+        这类非 ``Exception`` 异常。否则清理失败会把一次已经提交的删除报成 500，让客户端
+        误以为删除失败而重试，而会话其实早已不存在。
+        """
+        handled = 0
+        for file_key in file_keys:
             try:
                 (self.root / file_key).unlink(missing_ok=True)
-            except OSError:
-                pass
-        async with self.store.engine.begin() as conn:
-            await conn.execute(delete(resources).where(resources.c.session_id == session_id))
-        return len(rows)
+                handled += 1
+            except asyncio.CancelledError:
+                # 取消必须继续向上传播：吞掉它会让请求取消被清理循环拖住。
+                raise
+            except BaseException:
+                logger.warning("failed to purge resource file %s", file_key, exc_info=True)
+        return handled
 
     async def _load(self, resource_id: str, session_id: str) -> str | None:
         # 查询条件带上 session_id：资源不可跨会话读取。

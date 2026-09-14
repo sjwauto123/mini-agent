@@ -5,11 +5,13 @@
 - ``create_app`` 完成装配（含单实例锁、静态前端托管）并声明路由；
 - 路由只做"校验参数 → 调用领域对象 → 映射错误码"，业务逻辑都在 runtime/storage 里。
 
-错误约定：对外一律返回 ``{"code": ..., "message": ...}``，其中 ``code`` 是稳定标识，
-前端据此展示本地化文案；``message`` 只是兜底。
+错误约定：对外一律返回 ``{"code": ..., "message": ...}``，其中 ``code`` 是稳定标识（来自
+``errors`` 模块，前端据此展示本地化文案），``message`` 只是兜底。异常到错误码的转换统一走
+``error_code_of``，本层不再自己拆字符串——那样会让同一个失败在不同层得出不同的码。
 """
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import AppConfig, load_config
+from .errors import SUBMIT_HTTP_STATUS, answer_for, error_code_of
 from .events import RunEventBus
 from .model import HttpModelClient, ModelClient
 from .runtime import AgentRuntime
@@ -32,23 +35,34 @@ from .tools import build_registry
 
 # 终态集合：运行落到这些状态后，SSE 就可以收尾、前端可以释放输入框。
 TERMINAL = {"completed", "failed", "cancelled", "limit_reached", "interrupted"}
-# 本层直接产生的错误码文案（运行时的错误码由前端另行映射）。
-ERROR_MESSAGES = {
-    "model_not_configured": "模型未配置。",
-    "timezone_invalid": "时区配置无效。",
-    "session_busy_or_missing": "当前会话正在运行或会话不存在。",
-    "session_not_found": "会话不存在。",
-    "session_busy": "当前会话正在处理其他消息，请稍后再试。",
-    "run_not_found": "运行记录不存在。",
-    "resource_too_large": "资源内容过大。",
-    "request_key_conflict": "请求标识已被其他消息使用。",
-    "message_required": "请输入消息。",
-    "model_context_budget_invalid": "模型上下文配置无效。",
-}
+# 运行记录里不对外暴露的服务端字段：哈希与幂等键只用于内部去重。
+INTERNAL_RUN_FIELDS = frozenset({"input_hash", "request_key"})
+
+logger = logging.getLogger(__name__)
 
 
 def error_detail(code: str) -> dict[str, str]:
-    return {"code": code, "message": ERROR_MESSAGES.get(code, "请求处理失败，请稍后重试。")}
+    """构造统一的错误响应体。文案取自 errors 模块，本层不再维护第二份表。"""
+    return {"code": code, "message": answer_for(code, "请求处理失败，请稍后重试。")}
+
+
+def _submission_status(code: str) -> int:
+    """提交运行时：错误码 → HTTP 状态。
+
+    未收录的码说明这是未预期的内部失败，按 500 上报——不能把服务端 bug 说成用户输入有问题；
+    已收录但没特别约定状态的（缺消息、资源过大等）按请求内容问题处理，回 400。
+    """
+    status = SUBMIT_HTTP_STATUS.get(code)
+    if status is not None:
+        return status
+    return 400 if code in KNOWN_CODES else 500
+
+
+def public_run(run: dict[str, Any] | None) -> dict[str, Any] | None:
+    """剔除服务端内部字段后再把运行记录交给客户端。"""
+    if run is None:
+        return None
+    return {key: value for key, value in run.items() if key not in INTERNAL_RUN_FIELDS}
 
 
 class SessionCreate(BaseModel):
@@ -88,7 +102,9 @@ class AppServices:
             """按模型名构造客户端；测试通过 model_overrides 注入假实现。"""
             model_config = config.models.get(name)
             if not model_config:
-                raise LookupError(f"model_not_configured: {name}")
+                # 用 ValueError 而不是 LookupError：后者在领域里专指"按标识查不到会话/运行"，
+                # 混用会让"模型未配置"被映射成 404 会话不存在。
+                raise ValueError(f"model_not_configured: {name}")
             client = self.model_overrides.get(name)
             if not client:
                 # 缺少密钥在这里就报错，错误码里带上环境变量名，方便定位配置问题。
@@ -185,20 +201,25 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
     async def session_delete(session_id: str, request: Request) -> dict[str, Any]:
         if not await svc(request).store.get_session(session_id):
             raise HTTPException(404, detail=error_detail("session_not_found"))
-        # 先删资源文件，再删数据行；若会话正在运行，随后的 delete_session 会返回 False 并给出 409。
-        await svc(request).resources.delete_for_session(session_id)
-        deleted = await svc(request).store.delete_session(session_id)
-        if not deleted:
+        # 忙碌判定必须排在删除动作之前：被拒绝的请求不能留下任何副作用。
+        # 数据行的删除在一个事务里完成（含资源索引，见 Store.delete_session），
+        # 磁盘文件只能在事务提交之后清理——反过来会留下"有记录、无文件"的不可读资源。
+        purged = await svc(request).store.delete_session(session_id)
+        if purged is None:
             raise HTTPException(409, detail=error_detail("session_busy"))
+        await svc(request).resources.purge_files(purged)
         return {"id": session_id, "deleted": True}
 
     @app.patch("/api/sessions/{session_id}")
     async def session_update(session_id: str, body: SessionUpdate, request: Request) -> dict[str, Any]:
         if body.model_name not in svc(request).config.models:
             raise HTTPException(400, detail=error_detail("model_not_configured"))
-        # 会话忙碌或不存在都会返回 409，调用方无需区分（前端提示一致）。
+        # 这个接口没有副作用，所以"不存在"与"忙碌"可以分开报：前者 404、后者 409，
+        # 客户端不必靠猜来区分两种完全不同的处置方式。
+        if not await svc(request).store.get_session(session_id):
+            raise HTTPException(404, detail=error_detail("session_not_found"))
         if not await svc(request).store.set_session_model(session_id, body.model_name):
-            raise HTTPException(409, detail=error_detail("session_busy_or_missing"))
+            raise HTTPException(409, detail=error_detail("session_busy"))
         return {"id": session_id, "model_name": body.model_name}
 
     @app.get("/api/sessions/{session_id}/messages")
@@ -212,13 +233,12 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
         """提交一条消息。返回 202 —— 此时只是"受理"，回答要靠 SSE 或轮询获取。"""
         try:
             run, created = await svc(request).runtime.submit(session_id, body.message, body.request_key)
-        except LookupError:
-            raise HTTPException(404, detail=error_detail("session_not_found"))
-        except RuntimeError as exc:
-            # session_busy / model_call_limit 之类都走 409。
-            raise HTTPException(409, detail=error_detail(str(exc)))
-        except ValueError as exc:
-            raise HTTPException(400, detail=error_detail(str(exc)))
+        except Exception as exc:
+            # 归一化成稳定错误码后再决定状态码：同一个失败不能因为异常类型不同而时 404 时 409。
+            # 会话冲突 → 409；请求内容问题 → 400；服务端配置/依赖问题 → 503。
+            code = error_code_of(exc)
+            logger.warning("session %s run submission rejected: %s", session_id, code)
+            raise HTTPException(_submission_status(code), detail=error_detail(code))
         # 幂等命中时不重复启动，避免同一条消息跑两遍。
         if created:
             svc(request).launch(run["id"])
@@ -226,7 +246,7 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
 
     @app.get("/api/runs/{run_id}")
     async def run_get(run_id: str, request: Request) -> dict[str, Any]:
-        run = await svc(request).store.get_run(run_id)
+        run = public_run(await svc(request).store.get_run(run_id))
         if not run:
             raise HTTPException(404, detail=error_detail("run_not_found"))
         return run
@@ -236,13 +256,14 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
         # 前端刷新后用这个恢复"正在跑 / 已结束"，可能没有运行记录，因此允许返回 null。
         if not await svc(request).store.get_session(session_id):
             raise HTTPException(404, detail=error_detail("session_not_found"))
-        return await svc(request).store.latest_run(session_id)
+        return public_run(await svc(request).store.latest_run(session_id))
 
     @app.get("/api/sessions/{session_id}/runs")
     async def run_list(session_id: str, request: Request) -> list[dict[str, Any]]:
         if not await svc(request).store.get_session(session_id):
             raise HTTPException(404, detail=error_detail("session_not_found"))
-        return await svc(request).store.list_runs(session_id)
+        runs = await svc(request).store.list_runs(session_id)
+        return [public_run(run) or {} for run in runs]
 
     @app.get("/api/sessions/{session_id}/trace")
     async def session_trace(session_id: str, request: Request) -> list[dict[str, Any]]:
@@ -292,7 +313,7 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
                             # 这一轮被作废（协议非法，或重试要从头再流一遍）：让前端把该条消息撤掉。
                             yield f"event: discard\ndata: {json.dumps({'seq': event.get('seq')}, ensure_ascii=False)}\n\n"
                     # 增量之外再对一次数据库：运行状态快照与终态收尾始终以数据库为唯一真相。
-                    run = await svc(request).store.get_run(run_id)
+                    run = public_run(await svc(request).store.get_run(run_id))
                     if not run:
                         return
                     snapshot = json.dumps(run, ensure_ascii=False, sort_keys=True)
@@ -313,6 +334,10 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
                                 if payload != previous_message:
                                     yield f"event: message\ndata: {payload}\n\n"
                         return
+            except Exception:
+                # 推送过程中出错时，客户端只会看到连接断开，所以原因必须留在服务端日志里；
+                # 运行状态本身已落库，前端重连或重新拉快照都能拿到终态，不需要在这里补发事件。
+                logger.exception("run %s event stream aborted", run_id)
             finally:
                 # 客户端断开（生成器被关闭）时必须退订，否则频道里会一直留着一个没人读的队列。
                 svc(request).events.unsubscribe(run_id, queue)
@@ -327,9 +352,10 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
         try:
             resource_id = await svc(request).resources.save(session_id, body.content, body.kind)
         except ValueError as exc:
-            # 超大资源用 413，其余（如 kind 非法）用 400。
-            status_code = 413 if str(exc) == "resource_too_large" else 400
-            raise HTTPException(status_code, detail=error_detail(str(exc)))
+            # 归一化出错误码再决定状态码：超大资源用 413，其余（如 kind 非法）用 400。
+            code = error_code_of(exc)
+            status_code = 413 if code == "resource_too_large" else 400
+            raise HTTPException(status_code, detail=error_detail(code))
         return {"resource_id": resource_id, "kind": body.kind, "size": len(body.content.encode("utf-8"))}
 
     # 生产式运行：把前端构建产物挂到根路径。开发时目录不存在，就只提供 API。

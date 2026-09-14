@@ -11,6 +11,7 @@
 import ast
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -19,6 +20,9 @@ from typing import Any, Awaitable, Callable
 from jsonschema import Draft202012Validator, FormatChecker
 
 from .contracts import ExecutionContext, ToolResult
+
+# 工具自身的 bug 不能被悄悄吞掉：trace 里只有错误码，异常细节必须进服务端日志。
+logger = logging.getLogger(__name__)
 
 Handler = Callable[[dict[str, Any], ExecutionContext], Awaitable[ToolResult]]
 
@@ -57,13 +61,19 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def validate(self, name: str, args: dict[str, Any]) -> str | None:
-        """校验实参，返回第一条错误信息；通过则返回 None。"""
+        """校验实参，返回第一条错误（含字段路径）；通过则返回 None。"""
         spec = self._tools.get(name)
         if not spec:
             return "unknown_tool"
         # 按字段路径排序后取第一条，保证同样的参数每次报同一个错（否则报错内容会随机漂移）。
         errors = sorted(Draft202012Validator(spec.schema, format_checker=FormatChecker()).iter_errors(args), key=lambda e: list(e.path))
-        return errors[0].message if errors else None
+        if not errors:
+            return None
+        error = errors[0]
+        # 带上字段路径：jsonschema 的原始信息通常不含字段名（只说"5 is not of type 'string'"），
+        # 模型据此才知道该改哪个参数、往哪个方向改。
+        path = ".".join(str(part) for part in error.path) or "(整体)"
+        return f"{path}: {error.message}"
 
     async def execute(self, name: str, args: dict[str, Any], ctx: ExecutionContext) -> ToolResult:
         """校验并执行工具。任何失败都转成 ToolResult，不向上抛异常。"""
@@ -72,8 +82,10 @@ class ToolRegistry:
             return ToolResult(False, error={"code": "unknown_tool", "message": "未找到指定工具。", "outcome": "not_executed"})
         error = self.validate(name, args)
         if error:
-            # 对外只给稳定错误码，不暴露 JSON Schema 的原始报错文本。
-            return ToolResult(False, error={"code": "invalid_arguments", "message": "工具参数不符合要求。", "outcome": "not_executed"})
+            # 双轨：message 是稳定文案；detail 保留具体是哪个字段、错在哪。
+            # detail 只随工具结果进入模型上下文（前端不渲染 tool 消息），
+            # 模型据此才能针对性地改参数，否则只能收到一句"参数不符合要求"而反复试错。
+            return ToolResult(False, error={"code": "invalid_arguments", "message": "工具参数不符合要求。", "detail": error, "outcome": "not_executed"})
         try:
             result = await asyncio.wait_for(spec.handler(args, ctx), timeout=self.timeout)
             # 工具声明为 mock 时，无论它自己怎么说，都强制标注为模拟数据。
@@ -81,8 +93,12 @@ class ToolRegistry:
             return result
         except asyncio.TimeoutError:
             # 超时后无法确定工具是否已产生副作用，因此 outcome 记为 unknown 而不是 failed。
+            logger.warning("tool %s timed out after %ss", name, self.timeout)
             return ToolResult(False, error={"code": "tool_timeout", "message": "工具执行超时。", "outcome": "unknown"})
-        except Exception as exc:
+        except Exception:
+            # 走到这里说明工具实现本身有问题（业务错误应当由工具自己返回 ok=False）。
+            # 对外只给稳定错误码，堆栈留在服务端日志，否则线上无从定位。
+            logger.exception("tool %s raised", name)
             return ToolResult(False, error={"code": "tool_error", "message": "工具执行失败，请稍后重试。", "outcome": "failed"})
 
 def _calc_node(node: ast.AST, depth: int = 0) -> float | int:
@@ -122,9 +138,11 @@ async def calculator(args: dict[str, Any], _: ExecutionContext) -> ToolResult:
         if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))): raise ValueError("non-finite result")
         return ToolResult(True, {"expression": expression, "value": value})
     except ZeroDivisionError:
-        # 除零是"算式合法但结果无定义"，与其他格式错误分开报码，便于模型解释给用户。
+        # 除零是"算式合法但结果无定义"：确实执行了计算，所以 outcome 是 failed。
         return ToolResult(False, error={"code": "division_by_zero", "message": "除数不能为零。", "outcome": "failed"})
-    except Exception as exc:
+    except Exception:
+        # 表达式写错属于预期内的业务结果，用 debug 级别留痕即可，避免正常的纠错路径刷满日志。
+        logger.debug("calculator rejected expression %r", expression, exc_info=True)
         return ToolResult(False, error={"code": "invalid_expression", "message": "算式格式不正确，仅支持数字和四则运算。", "outcome": "not_executed"})
 
 async def search(args: dict[str, Any], _: ExecutionContext) -> ToolResult:
@@ -138,11 +156,12 @@ async def weather(args: dict[str, Any], _: ExecutionContext) -> ToolResult:
     city, requested = args["city"], date.fromisoformat(args["date"])
     today = date.today()
     # 超出窗口的日期明确报错，而不是编一个温度出来 —— 保持"不支持就说不知道"的行为。
+    # outcome 用 not_executed：没有查到任何数据，不是"执行失败"。
     if requested < today or requested > today + timedelta(days=6):
-        return ToolResult(False, error={"code": "date_not_supported", "message": "模拟天气仅支持今天起七天内的日期。", "outcome": "failed"}, mock=True)
+        return ToolResult(False, error={"code": "date_not_supported", "message": "模拟天气仅支持今天起七天内的日期。", "outcome": "not_executed"}, mock=True)
     conditions = {"北京": ("rain", 18), "上海": ("sunny", 25), "深圳": ("cloudy", 27)}
     if city not in conditions:
-        return ToolResult(False, error={"code": "location_not_supported", "message": "暂不支持查询该城市的模拟天气。", "outcome": "failed"}, mock=True)
+        return ToolResult(False, error={"code": "location_not_supported", "message": "暂不支持查询该城市的模拟天气。", "outcome": "not_executed"}, mock=True)
     condition, temp = conditions[city]
     return ToolResult(True, {"city": city, "date": requested.isoformat(), "condition": condition, "temperature_c": temp, "source": "mock"}, mock=True)
 
