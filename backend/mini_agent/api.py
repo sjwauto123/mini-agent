@@ -110,7 +110,14 @@ class AppServices:
                 # 缺少密钥在这里就报错，错误码里带上环境变量名，方便定位配置问题。
                 if not model_config.api_key:
                     raise RuntimeError(f"model_api_key_missing: {model_config.api_key_env}")
-                client = HttpModelClient(model_config.endpoint, model_config.model, model_config.api_key, model_config.mode, config.model_timeout, model_config.output_reserve)
+                client = HttpModelClient(
+                    model_config.endpoint,
+                    model_config.model,
+                    model_config.api_key,
+                    model_config.mode,
+                    config.model_timeout,
+                    model_config.output_reserve
+                )
             return client, model_config.mode, model_config.context_window, model_config.output_reserve
 
         self.runtime = AgentRuntime(
@@ -179,7 +186,12 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
     @app.get("/api/models")
     async def model_list(request: Request) -> list[dict[str, Any]]:
         # 不返回 endpoint / api_key_env，避免把服务端配置暴露给浏览器。
-        return [{"name": item.name, "model": item.model, "mode": item.mode, "context_window": item.context_window} for item in svc(request).config.models.values()]
+        return [{
+            "name": item.name,
+            "model": item.model,
+            "mode": item.mode,
+            "context_window": item.context_window
+        } for item in svc(request).config.models.values()]
 
     @app.post("/api/sessions", status_code=201)
     async def session_create(body: SessionCreate, request: Request) -> dict[str, Any]:
@@ -305,7 +317,11 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
                         event = None
                     if event is not None:
                         if event.get("type") == "delta":
-                            message = {"seq": event.get("seq"), "content": event.get("content") or "", "thinking": event.get("thinking") or ""}
+                            message = {
+                                "seq": event.get("seq"),
+                                "content": event.get("content") or "",
+                                "thinking": event.get("thinking") or ""
+                            }
                             # 工具轮在结束的那一刻就带上 tool_calls：前端据此立即改显示成
                             # "调用了 N 个工具"，而不会继续把决策说明当回答渲染（那会与思考面板重复）。
                             if event.get("tool_calls"):
@@ -316,7 +332,10 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
                                 previous_message = payload
                         elif event.get("type") == "discard":
                             # 这一轮被作废（协议非法，或重试要从头再流一遍）：让前端把该条消息撤掉。
-                            yield f"event: discard\ndata: {json.dumps({'seq': event.get('seq')}, ensure_ascii=False)}\n\n"
+                            yield (
+                                "event: discard\ndata: "
+                                f"{json.dumps({'seq': event.get('seq')}, ensure_ascii=False)}\n\n"
+                            )
                         elif event.get("type") == "notice":
                             # 过程性提示（如"上游无响应，正在重试"）：不改变任何数据，
                             # 只是让长时间没有增量的沉默期在界面上有解释。
@@ -335,12 +354,19 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
                         # 载荷带 seq，前端据此精确定位要更新的那条消息，不做“最后一条助手消息”的猜测。
                         # 工具轮的正文是决策说明而非答案，这里照旧不当作回答推送。
                         messages = await svc(request).store.list_messages(run["session_id"])
-                        assistant = next((item for item in reversed(messages) if item.get("run_id") == run_id and item.get("role") == "assistant"), None)
+                        assistant = next((
+                            item for item in reversed(messages)
+                            if item.get("run_id") == run_id and item.get("role") == "assistant"
+                        ), None)
                         if assistant is not None:
                             content = "" if assistant.get("tool_calls") else (assistant.get("content") or "")
                             thinking = assistant.get("thinking") or ""
                             if content or thinking:
-                                payload = json.dumps({"seq": assistant.get("seq"), "content": content, "thinking": thinking}, ensure_ascii=False)
+                                payload = json.dumps({
+                                    "seq": assistant.get("seq"),
+                                    "content": content,
+                                    "thinking": thinking
+                                }, ensure_ascii=False)
                                 if payload != previous_message:
                                     yield f"event: message\ndata: {payload}\n\n"
                         return

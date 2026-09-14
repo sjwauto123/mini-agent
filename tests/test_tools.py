@@ -42,8 +42,16 @@ async def test_resource_read_search_and_isolation(services):
     store, resources, registry = services
     first, second = await store.create_session(), await store.create_session()
     resource_id = await resources.save(first, "alpha beta gamma beta")
-    page = await registry.execute("resource_read", {"resource_id": resource_id, "cursor": 0, "limit": 5}, ExecutionContext("r1", first))
-    found = await registry.execute("resource_search", {"resource_id": resource_id, "query": "beta"}, ExecutionContext("r1", first))
+    page = await registry.execute("resource_read", {
+        "resource_id": resource_id,
+        "cursor": 0,
+        "limit": 5
+    }, ExecutionContext("r1", first))
+    found = await registry.execute(
+        "resource_search",
+        {"resource_id": resource_id, "query": "beta"},
+        ExecutionContext("r1", first)
+    )
     denied = await registry.execute("resource_read", {"resource_id": resource_id}, ExecutionContext("r2", second))
     assert page.data["content"] == "alpha" and page.data["next_cursor"] == 5
     assert found.data["matches"][0]["position"] == 6

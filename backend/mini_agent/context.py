@@ -47,7 +47,16 @@ class ContextBundle:
 
 
 class ContextManager:
-    def __init__(self, store: Store, context_window: int, output_reserve: int, safety_margin: int = 1024, *, soft_ratio: float = .70, hard_ratio: float = .85) -> None:
+    def __init__(
+        self,
+        store: Store,
+        context_window: int,
+        output_reserve: int,
+        safety_margin: int = 1024,
+        *,
+        soft_ratio: float = .70,
+        hard_ratio: float = .85
+    ) -> None:
         self.store = store
         # 可用输入预算：上下文窗口扣掉"留给回答的输出"和一点安全余量。
         self.input_budget = context_window - output_reserve - safety_margin
@@ -66,7 +75,14 @@ class ContextManager:
         message = {key: row[key] for key in self.MODEL_MESSAGE_KEYS if key in row}
         return {"role": row["role"], **message}
 
-    async def prepare(self, session_id: str, tools: list[dict[str, Any]], repair: str | None = None, target_ratio: float | None = None, only_run_id: str | None = None) -> ContextBundle:
+    async def prepare(
+        self,
+        session_id: str,
+        tools: list[dict[str, Any]],
+        repair: str | None = None,
+        target_ratio: float | None = None,
+        only_run_id: str | None = None
+    ) -> ContextBundle:
         """组装本轮要发给模型的消息。
 
         ``repair`` 是协议修复指令（模型上次响应不合法时追加），会作为 system 消息放在历史之后；
@@ -114,7 +130,14 @@ class ContextManager:
                 notice = [{"role": "user", "content": "为适应模型上下文限制，较早且尚未摘要的对话已暂时省略。"}] if incomplete else []
                 model_messages = system + notice + [self._to_model_message(row) for row in kept]
                 used = estimate_tokens({"messages": model_messages, "tools": tools})
-        return ContextBundle(model_messages, used, self.input_budget, used >= self.input_budget * self.soft_ratio, used >= self.input_budget * self.hard_ratio, incomplete)
+        return ContextBundle(
+            model_messages,
+            used,
+            self.input_budget,
+            used >= self.input_budget * self.soft_ratio,
+            used >= self.input_budget * self.hard_ratio,
+            incomplete
+        )
 
     async def compression_candidate(self, session_id: str) -> tuple[list[dict[str, Any]], int] | None:
         """挑出可以被压缩的较早轮次。
@@ -139,7 +162,12 @@ class ContextManager:
         # 一并返回覆盖到的最大 seq，写摘要时据此记录"压到哪一条为止"。
         return candidate, int(candidate[-1]["seq"])
 
-    def summary_messages(self, previous: str | None, candidate: list[dict[str, Any]], json_mode: bool = False) -> list[dict[str, Any]]:
+    def summary_messages(
+        self,
+        previous: str | None,
+        candidate: list[dict[str, Any]],
+        json_mode: bool = False
+    ) -> list[dict[str, Any]]:
         """把待压缩的对话包装成"让模型写摘要"的请求。"""
         # run_id 是内部字段，对摘要没有意义，去掉可以省点 token。
         payload = [{key: value for key, value in row.items() if key not in {"run_id"}} for row in candidate]
@@ -149,5 +177,8 @@ class ContextManager:
             instruction += ' 请严格使用以下 JSON 格式返回摘要：{"action":"final","decision_summary":"","tool":null,"answer":"摘要内容"}。'
         return [
             {"role": "system", "content": instruction},
-            {"role": "user", "content": json.dumps({"previous_summary": previous, "conversation": payload}, ensure_ascii=False)},
+            {"role": "user", "content": json.dumps({
+                "previous_summary": previous,
+                "conversation": payload
+            }, ensure_ascii=False)},
         ]

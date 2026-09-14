@@ -180,7 +180,12 @@ async def test_add_trace_returns_id_and_supports_parent_chain(tmp_path: Path):
         # 自增 id 应当严格单调，调用方据此把后续事件挂在正确的层级下。
         root = await store.add_trace(run["id"], "run.started", {})
         model_started = await store.add_trace(run["id"], "model.started", {"attempt": 1, "iteration": 1})
-        tool_started = await store.add_trace(run["id"], "tool.started", {"call_id": "c1", "name": "calculator", "iteration": 1, "parent_id": model_started})
+        tool_started = await store.add_trace(run["id"], "tool.started", {
+            "call_id": "c1",
+            "name": "calculator",
+            "iteration": 1,
+            "parent_id": model_started
+        })
         assert isinstance(root, int) and root > 0
         assert isinstance(model_started, int) and model_started > root
         assert isinstance(tool_started, int) and tool_started > model_started

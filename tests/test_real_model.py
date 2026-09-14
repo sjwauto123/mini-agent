@@ -73,13 +73,22 @@ async def test_deepseek_native_tool_loop(tmp_path: Path):
         assert "READY" in direct.answer.upper()
 
         calculation = await ask("Use the calculator tool to calculate 37 * 29, then report the result.")
-        assert any(item["name"] == "calculator" and item["result"]["data"]["value"] == 1073 for item in calculation.operations)
+        assert any(
+            item["name"] == "calculator" and item["result"]["data"]["value"] == 1073
+            for item in calculation.operations
+        )
 
         followup = await ask("Use the calculator tool to divide that previous result by 7.")
-        assert any(item["name"] == "calculator" and item["result"]["data"]["value"] == 1073 / 7 for item in followup.operations)
+        assert any(
+            item["name"] == "calculator" and item["result"]["data"]["value"] == 1073 / 7
+            for item in followup.operations
+        )
 
         tomorrow = (date.today() + timedelta(days=1)).isoformat()
-        conditional = await ask(f"Use the weather tool for 北京 on {tomorrow}. If the mock result says rain, add a todo with text 明天带伞. Then report what happened.")
+        conditional = await ask(
+            f"Use the weather tool for 北京 on {tomorrow}. If the mock result says rain, "
+            "add a todo with text 明天带伞. Then report what happened."
+        )
         assert [item["name"] for item in conditional.operations] == ["weather", "todo"]
         todos = await registry.execute("todo", {"action": "list"}, ExecutionContext("verify", session_id))
         assert any(item["text"] == "明天带伞" for item in todos.data["items"])

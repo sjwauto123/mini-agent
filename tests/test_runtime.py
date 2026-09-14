@@ -34,7 +34,12 @@ async def test_direct_answer_uses_no_tool(services):
 
 
 async def test_tool_loop_and_followup_context(services):
-    model = ScriptedModel([tool("c1", "calculator", '{"expression":"125*8"}'), final("The answer is 1000."), tool("c2", "calculator", '{"expression":"1000/4"}'), final("250")])
+    model = ScriptedModel([
+        tool("c1", "calculator", '{"expression":"125*8"}'),
+        final("The answer is 1000."),
+        tool("c2", "calculator", '{"expression":"1000/4"}'),
+        final("250")
+    ])
     runtime, store, session_id = await make_runtime(services, model)
     first, _ = await runtime.submit(session_id, "Calculate 125 * 8")
     result1 = await runtime.execute(first["id"])
@@ -237,7 +242,12 @@ async def test_large_tool_result_is_externalized(services):
     store, resources, registry = services
     async def huge(_, __):
         return ToolResult(True, {"content": "x" * 100_000})
-    registry.register(ToolSpec("huge", "Return a large test result.", {"type": "object", "additionalProperties": False}, huge))
+    registry.register(ToolSpec(
+        "huge",
+        "Return a large test result.",
+        {"type": "object", "additionalProperties": False},
+        huge
+    ))
     model = ScriptedModel([tool("large-1", "huge", "{}"), final("stored")])
     runtime = AgentRuntime(store, registry, resources, lambda _: (model, "native", 16384, 2048))
     session_id = await store.create_session()
@@ -303,7 +313,11 @@ async def test_long_input_is_externalized_before_model_call(services):
     user_message = (await store.list_messages(session_id))[0]["content"]
     resource_id = re.search(r"资源 ([0-9a-f-]{36})", user_message).group(1)
     assert original not in json.dumps(model.calls[0]["messages"])
-    restored = await runtime.registry.execute("resource_read", {"resource_id": resource_id, "limit": 10}, runtime_context(run["id"], session_id))
+    restored = await runtime.registry.execute(
+        "resource_read",
+        {"resource_id": resource_id, "limit": 10},
+        runtime_context(run["id"], session_id)
+    )
     assert restored.ok and restored.data["content"] == "x" * 10
     assert run["input_preview"] == original[:500]
 
@@ -312,7 +326,11 @@ async def test_resource_read_is_budgeted_and_not_externalized_again(services):
     store, resources, registry = services
     session_id = await store.create_session()
     resource_id = await resources.save(session_id, "z" * 20_000)
-    model = ScriptedModel([tool("read-1", "resource_read", json.dumps({"resource_id": resource_id, "limit": 20_000})), final("read a page")])
+    model = ScriptedModel([tool(
+        "read-1",
+        "resource_read",
+        json.dumps({"resource_id": resource_id, "limit": 20_000})
+    ), final("read a page")])
     runtime = AgentRuntime(store, registry, resources, lambda _: (model, "native", 16384, 2048))
     run, _ = await runtime.submit(session_id, "read the resource")
     result = await runtime.execute(run["id"])
@@ -324,7 +342,10 @@ async def test_resource_read_is_budgeted_and_not_externalized_again(services):
 
 
 async def test_search_prompt_injection_remains_tool_data(services):
-    model = ScriptedModel([tool("search-1", "search", '{"query":"untrusted"}'), final("The mock result contains untrusted text.")])
+    model = ScriptedModel([
+        tool("search-1", "search", '{"query":"untrusted"}'),
+        final("The mock result contains untrusted text.")
+    ])
     runtime, _, session_id = await make_runtime(services, model)
     run, _ = await runtime.submit(session_id, "find the untrusted sample")
     result = await runtime.execute(run["id"])
@@ -358,12 +379,18 @@ async def test_summary_failures_use_two_attempts_then_fall_back(services):
     run, _ = await runtime.submit(session_id, "continue")
     result = await runtime.execute(run["id"])
     trace = await store.list_trace(run["id"])
-    summary_starts = [item for item in trace if item["event_type"] == "model.started" and item["payload"]["phase"] == "summary"]
+    summary_starts = [
+        item for item in trace
+        if item["event_type"] == "model.started" and item["payload"]["phase"] == "summary"
+    ]
     assert result.status == "completed"
     assert len(summary_starts) == 2
     assert len(model.calls) == 3
     assert await store.latest_summary(session_id) is None
-    assert any(item["event_type"] == "context.compaction_failed" and item["payload"]["summary_calls"] == 2 for item in trace)
+    assert any(
+        item["event_type"] == "context.compaction_failed" and item["payload"]["summary_calls"] == 2
+        for item in trace
+    )
 
 
 async def test_todo_and_tool_record_roll_back_together(services, monkeypatch):

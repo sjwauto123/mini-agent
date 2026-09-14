@@ -45,7 +45,11 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """在线模式：真连数据库执行迁移。NullPool 避免迁移连接被池化后长期占着锁。"""
-    connectable = engine_from_config(config.get_section(config.config_ini_section, {}), prefix="sqlalchemy.", poolclass=pool.NullPool)
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool
+    )
     with connectable.connect() as connection:
         # compare_type=True：字段类型变化也要被 autogenerate 检测到。
         context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)

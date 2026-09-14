@@ -38,7 +38,12 @@ def live_server(tmp_path: Path):
     model = ModelConfig("test", "http://example.invalid", "fake", "UNUSED", "native", 16384, 2048)
     config = AppConfig(data_dir=tmp_path, models={"test": model})
     migrate_database(tmp_path / "state.db")
-    server = uvicorn.Server(uvicorn.Config(create_app(config, {"test": EchoModel()}), host="127.0.0.1", port=port, log_level="warning"))
+    server = uvicorn.Server(uvicorn.Config(
+        create_app(config, {"test": EchoModel()}),
+        host="127.0.0.1",
+        port=port,
+        log_level="warning"
+    ))
     errors: list[BaseException] = []
 
     def serve() -> None:
@@ -147,7 +152,9 @@ def test_two_browser_pages_keep_sessions_isolated_and_restore(live_server: str, 
             expect(first).to_have_url(re.compile(re.escape(first_session)))
             expect(first.locator(".assistant .bubble").first).to_contain_text("Echo: window one")
 
-            first.get_by_placeholder("请输入您想要咨询的问题...").fill("| 工具 | 作用 |\n|---|---|\n| calculator | 计算 |\n| todo | 待办 |")
+            first.get_by_placeholder("请输入您想要咨询的问题...").fill(
+                "| 工具 | 作用 |\n|---|---|\n| calculator | 计算 |\n| todo | 待办 |"
+            )
             first.get_by_placeholder("请输入您想要咨询的问题...").press("Enter")
             expect(first.locator(".assistant .bubble table")).to_have_count(1)
             expect(first.locator(".assistant .bubble table")).to_contain_text("calculator")

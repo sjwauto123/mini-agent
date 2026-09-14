@@ -10,7 +10,13 @@ from .fakes import final, tool
 
 def mock_client(handler, mode: str = "native") -> HttpModelClient:
     """构造一个不联网的 HttpModelClient：用 MockTransport 接管全部请求。"""
-    return HttpModelClient("https://example.invalid/v1/chat/completions", "test-model", "key", mode, transport=httpx.MockTransport(handler))
+    return HttpModelClient(
+        "https://example.invalid/v1/chat/completions",
+        "test-model",
+        "key",
+        mode,
+        transport=httpx.MockTransport(handler)
+    )
 
 
 def test_native_final_and_tool_call():
@@ -55,7 +61,10 @@ def test_native_tool_call_uses_decision_note_as_thinking():
 
 
 def test_json_protocol():
-    raw = {"content": '{"action":"tool_call","decision_summary":"calc","tool":{"name":"calculator","arguments":{"expression":"4*5"}},"answer":null}'}
+    raw = {"content": (
+        '{"action":"tool_call","decision_summary":"calc",'
+        '"tool":{"name":"calculator","arguments":{"expression":"4*5"}},"answer":null}'
+    )}
     parsed = parse_response(raw, "json")
     assert isinstance(parsed, ToolCall)
     assert parsed.name == "calculator"
@@ -69,7 +78,10 @@ def test_json_blank_body_is_reported_as_empty_response():
 
 
 def test_json_accepts_fenced_object_and_flags_truncation():
-    fenced = {"content": '```json\n{"action":"final","decision_summary":"","tool":null,"answer":"好了"}\n```', "finish_reason": "stop"}
+    fenced = {
+        "content": '```json\n{"action":"final","decision_summary":"","tool":null,"answer":"好了"}\n```',
+        "finish_reason": "stop"
+    }
     parsed = parse_response(fenced, "json")
     assert isinstance(parsed, Final) and parsed.answer == "好了"
     truncated = parse_response({"content": '{"action":"final","ans', "finish_reason": "length"}, "json")

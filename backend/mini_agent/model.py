@@ -48,7 +48,13 @@ def _decode_json(response: httpx.Response) -> dict[str, Any]:
 
 class ModelClient(Protocol):
     """模型客户端的结构类型；测试里用假实现替换，无需继承。"""
-    async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, tool_choice: str = "auto") -> dict[str, Any]: ...
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        tool_choice: str = "auto"
+    ) -> dict[str, Any]: ...
 
 def _strict_object(value: str) -> dict[str, Any]:
     """严格解析工具参数 JSON。
@@ -59,11 +65,13 @@ def _strict_object(value: str) -> dict[str, Any]:
     def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, item in items:
-            if key in result: raise ValueError(f"JSON 中存在重复字段：{key}")
+            if key in result:
+                raise ValueError(f"JSON 中存在重复字段：{key}")
             result[key] = item
         return result
     parsed = json.loads(value, object_pairs_hook=pairs, parse_constant=lambda x: (_ for _ in ()).throw(ValueError(x)))
-    if not isinstance(parsed, dict): raise ValueError("工具参数必须是 JSON 对象")
+    if not isinstance(parsed, dict):
+        raise ValueError("工具参数必须是 JSON 对象")
     return parsed
 
 # 首行决策说明的识别规则：容忍「思考」「决策说明」「决策」三种叫法，中英文冒号都接受。
@@ -134,13 +142,17 @@ def parse_response(raw: dict[str, Any], mode: str = "native") -> ModelEvent:
                 return Invalid("model_protocol_error", "JSON final 缺少合法 answer")
             if action == "tool_call":
                 tool = payload.get("tool")
-                if not isinstance(tool, dict) or not isinstance(tool.get("name"), str) or not isinstance(tool.get("arguments"), dict):
+                if not isinstance(tool, dict) or not isinstance(
+                    tool.get("name"),
+                    str
+                ) or not isinstance(tool.get("arguments"), dict):
                     return Invalid("model_protocol_error", "JSON tool_call 字段不合法")
                 # JSON 协议不返回 call_id，本地生成一个即可（同一轮内唯一）。
                 return ToolCall(str(uuid4()), tool["name"], tool["arguments"], ds[:500], reasoning)
             return Invalid("model_protocol_error", f"JSON action 未知：{action}")
         choice = raw["choices"][0]
-        if choice.get("finish_reason") == "length": return Invalid("model_truncated", "模型输出被截断")
+        if choice.get("finish_reason") == "length":
+            return Invalid("model_truncated", "模型输出被截断")
         message = choice["message"]
         reasoning = str(message.get("reasoning_content") or "").strip()
         calls = message.get("tool_calls") or []
@@ -148,12 +160,15 @@ def parse_response(raw: dict[str, Any], mode: str = "native") -> ModelEvent:
         note, body = split_decision_note(raw_content if isinstance(raw_content, str) else "")
         if calls:
             # 只允许单工具调用：串行执行比并发更容易保证"工具结果与消息落在同一事务"。
-            if len(calls) != 1: return Invalid("multiple_tool_calls", "每次最多只能调用一个工具")
-            call = calls[0]; function = call["function"]
+            if len(calls) != 1:
+                return Invalid("multiple_tool_calls", "每次最多只能调用一个工具")
+            call = calls[0]
+            function = call["function"]
             # 决策说明优先用首行约定；模型没写就退回正文、再退回私有推理。
             thinking = (note or body or reasoning)[:500]
             return ToolCall(call["id"], function["name"], _strict_object(function["arguments"]), thinking, reasoning)
-        if body: return Final(body, (note or reasoning)[:500])
+        if body:
+            return Final(body, (note or reasoning)[:500])
         # 既没有工具调用、也没有正文：典型的"模型退化"，由运行时换最小上下文重试。
         return Invalid("empty_response", "模型没有返回回答或工具调用")
     except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -162,18 +177,45 @@ def parse_response(raw: dict[str, Any], mode: str = "native") -> ModelEvent:
 
 class HttpModelClient:
     """基于 HTTP 的模型客户端，直接对接 OpenAI 兼容接口。"""
-    def __init__(self, endpoint: str, model: str, api_key: str, mode: str = "native", timeout: float = 60, max_tokens: int = 2048, transport: httpx.AsyncBaseTransport | None = None) -> None:
-        self.endpoint, self.model, self.api_key, self.mode, self.timeout, self.max_tokens = endpoint, model, api_key, mode, timeout, max_tokens
+    def __init__(
+        self,
+        endpoint: str,
+        model: str,
+        api_key: str,
+        mode: str = "native",
+        timeout: float = 60,
+        max_tokens: int = 2048,
+        transport: httpx.AsyncBaseTransport | None = None
+    ) -> None:
+        self.endpoint, self.model, self.api_key, self.mode, self.timeout, self.max_tokens = (
+            endpoint, model, api_key, mode, timeout, max_tokens
+        )
         # transport 是给测试用的注入点（MockTransport）；生产路径保持 None，走 httpx 默认实现。
         self.transport = transport
 
-    async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, tool_choice: str = "auto") -> dict[str, Any]:
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        tool_choice: str = "auto"
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens}
         # native 走工具协议；json 走 response_format 约束。两者不要混用。
-        if self.mode == "native": payload.update({"tools": tools, "tool_choice": tool_choice, "parallel_tool_calls": False})
-        else: payload["response_format"] = {"type": "json_object"}
+        if self.mode == "native":
+            payload.update({
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "parallel_tool_calls": False
+            })
+        else:
+            payload["response_format"] = {"type": "json_object"}
         async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
-            response = await client.post(self.endpoint, headers={"Authorization": f"Bearer {self.api_key}"}, json=payload)
+            response = await client.post(
+                self.endpoint,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json=payload
+            )
             # 先判状态码再解析正文：4xx/5xx 的正文通常是错误说明，不是模型输出。
             _check_response(response)
             data = _decode_json(response)
@@ -194,7 +236,13 @@ class HttpModelClient:
             "usage": data.get("usage"),
         }
 
-    async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], *, tool_choice: str = "auto") -> AsyncIterator[dict[str, Any]]:
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        tool_choice: str = "auto"
+    ) -> AsyncIterator[dict[str, Any]]:
         """流式调用模型：逐块产出增量，最后产出一份与 ``complete()`` 同构的完整响应。
 
         产出三类 chunk：
@@ -209,7 +257,13 @@ class HttpModelClient:
         ``tool_calls`` 在流式协议里是分片下发的（同一个 index 的 name/arguments 会在多个 chunk 里续接），
         因此这里按 index 归并后再拼字符串，不能简单覆盖。
         """
-        payload: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": True, "stream_options": {"include_usage": True}}
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": self.max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True}
+        }
         if self.mode == "native":
             payload.update({"tools": tools, "tool_choice": tool_choice, "parallel_tool_calls": False})
         else:
@@ -220,7 +274,12 @@ class HttpModelClient:
         finish_reason: str | None = None
         usage: dict[str, Any] | None = None
         async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
-            async with client.stream("POST", self.endpoint, headers={"Authorization": f"Bearer {self.api_key}"}, json=payload) as response:
+            async with client.stream(
+                "POST",
+                self.endpoint,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json=payload
+            ) as response:
                 # 流式响应同样要先校验状态码，否则 4xx/5xx 会被当成"空流"静默走完。
                 _check_response(response)
                 async for line in response.aiter_lines():
@@ -249,7 +308,11 @@ class HttpModelClient:
                             yield {"type": "content", "text": content}
                         for call in delta.get("tool_calls") or []:
                             index = int(call.get("index") or 0)
-                            slot = calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            slot = calls.setdefault(index, {
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""}
+                            })
                             if call.get("id"):
                                 slot["id"] = call["id"]
                             function = call.get("function") or {}
@@ -258,12 +321,23 @@ class HttpModelClient:
                                 slot["function"]["name"] += function["name"]
                             if function.get("arguments"):
                                 slot["function"]["arguments"] += function["arguments"]
-        message: dict[str, Any] = {"content": "".join(content_parts) or None, "reasoning_content": "".join(reasoning_parts)}
+        message: dict[str, Any] = {
+            "content": "".join(content_parts) or None,
+            "reasoning_content": "".join(reasoning_parts)
+        }
         if calls:
             message["tool_calls"] = [calls[index] for index in sorted(calls)]
         if self.mode == "native":
-            yield {"type": "done", "raw": {"choices": [{"finish_reason": finish_reason, "message": message}], "usage": usage}}
+            yield {"type": "done", "raw": {"choices": [{
+                "finish_reason": finish_reason,
+                "message": message
+            }], "usage": usage}}
         else:
             # JSON 模式摊平成与 complete() 一致的形态，parse_response 只认这一套字段。
-            yield {"type": "done", "raw": {"content": message["content"], "reasoning_content": message["reasoning_content"], "finish_reason": finish_reason, "usage": usage}}
+            yield {"type": "done", "raw": {
+                "content": message["content"],
+                "reasoning_content": message["reasoning_content"],
+                "finish_reason": finish_reason,
+                "usage": usage
+            }}
 

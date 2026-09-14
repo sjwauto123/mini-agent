@@ -83,7 +83,15 @@ def load_config(path: Path | None = None) -> AppConfig:
         mode = value.get("mode", "native")
         if mode not in {"native", "json"}:
             raise ValueError(f"model {name}: mode must be native or json")
-        models[name] = ModelConfig(name=name, endpoint=value["endpoint"], model=value["model"], api_key_env=value["api_key_env"], mode=mode, context_window=int(value["context_window"]), output_reserve=int(value.get("output_reserve", 2048)))
+        models[name] = ModelConfig(
+            name=name,
+            endpoint=value["endpoint"],
+            model=value["model"],
+            api_key_env=value["api_key_env"],
+            mode=mode,
+            context_window=int(value["context_window"]),
+            output_reserve=int(value.get("output_reserve", 2048))
+        )
     runtime = raw.get("runtime", {})
     config = AppConfig(
         data_dir=data_dir,

@@ -236,7 +236,10 @@ def test_delete_when_idle_purges_session_and_files(tmp_path: Path):
         assert client.get(f"/api/sessions/{session_id}/messages").status_code == 404
         # 资源索引必须与外键同事务清掉，否则删会话会被 FOREIGN KEY 约束挡下。
         with sqlite3.connect(tmp_path / "state.db") as connection:
-            remaining = connection.execute("select count(*) from resources where session_id = ?", (session_id,)).fetchone()[0]
+            remaining = connection.execute(
+                "select count(*) from resources where session_id = ?",
+                (session_id,)
+            ).fetchone()[0]
         assert remaining == 0
 
 
@@ -263,7 +266,10 @@ def test_delete_survives_resource_cleanup_failure(tmp_path: Path, monkeypatch: p
         # 删除结果以数据库为准：会话与资源索引都已清理，文件残留不影响事实。
         assert client.get(f"/api/sessions/{session_id}/messages").status_code == 404
         with sqlite3.connect(tmp_path / "state.db") as connection:
-            remaining = connection.execute("select count(*) from resources where session_id = ?", (session_id,)).fetchone()[0]
+            remaining = connection.execute(
+                "select count(*) from resources where session_id = ?",
+                (session_id,)
+            ).fetchone()[0]
         assert remaining == 0
 
 
@@ -338,7 +344,10 @@ def test_run_records_hide_internal_fields(tmp_path: Path):
     migrate_database(tmp_path / "state.db")
     with TestClient(create_app(config, {"test": ScriptedModel([final("ok")])})) as client:
         session_id = client.post("/api/sessions", json={"model_name": "test"}).json()["id"]
-        run_id = client.post(f"/api/sessions/{session_id}/runs", json={"message": "hi", "request_key": "k1"}).json()["run_id"]
+        run_id = client.post(
+            f"/api/sessions/{session_id}/runs",
+            json={"message": "hi", "request_key": "k1"}
+        ).json()["run_id"]
         assert wait_for_terminal(client, run_id)["status"] == "completed"
         records = [
             client.get(f"/api/runs/{run_id}").json(),

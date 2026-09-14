@@ -21,7 +21,11 @@ def final(text: str, reasoning: str = "") -> dict[str, Any]:
 
 
 def tool(call_id: str, name: str, arguments: str, content: str | None = None, reasoning: str = "") -> dict[str, Any]:
-    message: dict[str, Any] = {"content": content, "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}]}
+    message: dict[str, Any] = {"content": content, "tool_calls": [{
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments}
+    }]}
     if reasoning:
         message["reasoning_content"] = reasoning
     return {"choices": [{"finish_reason": "tool_calls", "message": message}]}
