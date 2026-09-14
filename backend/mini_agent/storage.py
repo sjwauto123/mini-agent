@@ -39,9 +39,18 @@ class Store:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.engine: AsyncEngine = create_async_engine(f"sqlite+aiosqlite:///{db_path.as_posix()}")
+
         @event.listens_for(self.engine.sync_engine, "connect")
-        def enable_foreign_keys(dbapi_connection: Any, _: Any) -> None:
+        def configure_sqlite(dbapi_connection: Any, _: Any) -> None:
             cursor = dbapi_connection.cursor()
+            # WAL：读写互不阻塞。客户端异常断开时（例如取消 SSE 流），连接可能在关闭途中被取消，
+            # 残留一个未释放的读事务；回滚日志模式（delete）下这会永久堵死后续所有写提交，
+            # 表现为创建会话等写接口持续 500「database is locked」。WAL 下读不再阻塞写，可规避该故障。
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL")
+            except Exception:
+                pass
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
@@ -115,7 +124,12 @@ class Store:
 
     async def update_message_content(self, session_id: str, seq: int, content: str) -> bool:
         async with self.engine.begin() as conn:
-            result = await conn.execute(update(messages).where(messages.c.session_id == session_id, messages.c.seq == seq, messages.c.role == "assistant").values(payload=json.dumps({"content": content}, ensure_ascii=False)))
+            existing = (await conn.execute(select(messages.c.payload).where(messages.c.session_id == session_id, messages.c.seq == seq, messages.c.role == "assistant"))).first()
+            if not existing:
+                return False
+            current = json.loads(existing[0]) if existing[0] else {}
+            current["content"] = content
+            result = await conn.execute(update(messages).where(messages.c.session_id == session_id, messages.c.seq == seq, messages.c.role == "assistant").values(payload=json.dumps(current, ensure_ascii=False)))
             return bool(result.rowcount)
 
     async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
