@@ -1,3 +1,17 @@
+"""Agent 运行时：一次运行的完整执行循环。
+
+主循环（``_execute``）反复做四件事，直到拿到最终回答：
+
+1. 检查是否被请求取消；
+2. 必要时压缩上下文（``_maybe_summarize``）；
+3. 组装消息并调用模型（``_model_call``，含重试与协作式取消）；
+4. 按模型响应分派：终答（流式落库）/ 工具调用（``_tool_call``）/ 协议非法（要求重答）。
+
+三条贯穿全文件的约定：
+- **一切可恢复的问题都先修再报错**：格式错误重答、空正文换最小上下文、传输错误退避重试；
+- **取消是协作式的**：长任务用 100ms 轮询检查取消标志，而不是强杀；
+- **状态先落库再返回**：任何出口都会写消息 + finish_run + trace，前端只依赖数据库状态。
+"""
 import asyncio
 import json
 import time
@@ -13,7 +27,10 @@ from .tools import ToolRegistry
 
 
 def _model_output_head(raw: dict[str, Any], limit: int = 160) -> dict[str, Any]:
-    """取出模型正文开头、结束原因与用量，仅用于在 trace 里定位协议错误原因。"""
+    """取出模型正文开头、结束原因与用量，仅用于在 trace 里定位协议错误原因。
+
+    兼容两种响应形态：原生协议的 ``choices[0].message`` 与 JSON 模式被摊平后的结构。
+    """
     try:
         has_choices = isinstance(raw.get("choices"), list) and raw["choices"]
         choice = raw["choices"][0] if has_choices else raw
@@ -25,6 +42,7 @@ def _model_output_head(raw: dict[str, Any], limit: int = 160) -> dict[str, Any]:
     except (KeyError, IndexError, TypeError, AttributeError):
         return {}
     text = "" if content is None else str(content)
+    # content_len 与 finish_reason 一起看，就能区分"被截断"和"模型真的只回了空白"。
     return {
         "finish_reason": finish,
         "content_len": len(text),
@@ -34,6 +52,8 @@ def _model_output_head(raw: dict[str, Any], limit: int = 160) -> dict[str, Any]:
     }
 
 
+# 原生协议下没有 decision_summary 字段，因此约定模型用首行「思考：…」承载决策说明。
+# 措辞要明确禁止"展开推理链"，否则模型容易把长篇思考写进用户可见的回答。
 NATIVE_PROTOCOL_HINT = (
     "请使用标准的工具调用方式工作。每次回复的第一行都必须是决策说明，格式固定为「思考：<一句简短中文判断依据>」，"
     "第二行起才是给用户的最终回答；需要调用工具时，第一行仍然写这条决策说明，然后再发出工具调用。"
@@ -69,13 +89,16 @@ def _repair_instruction(code: str, mode: str) -> str:
 class AgentRuntime:
     def __init__(self, store: Store, registry: ToolRegistry, resources: ResourceStore, model_factory: Callable[[str], tuple[ModelClient, str, int, int]], *, max_model_calls: int = 12, max_repairs: int = 2, max_summary_calls: int = 2, run_timeout: float = 180, safety_margin: int = 1024, soft_context_ratio: float = .70, hard_context_ratio: float = .85, target_context_ratio: float = .55) -> None:
         self.store, self.registry, self.resources = store, registry, resources
+        # model_factory 按模型名返回 (客户端, 协议, 上下文窗口, 输出预留)，便于同一进程服务多个模型。
         self.model_factory = model_factory
         self.max_model_calls, self.max_repairs, self.max_summary_calls, self.run_timeout = max_model_calls, max_repairs, max_summary_calls, run_timeout
         self.safety_margin = safety_margin
         self.soft_context_ratio, self.hard_context_ratio, self.target_context_ratio = soft_context_ratio, hard_context_ratio, target_context_ratio
+        # 串行化"创建运行"这一步：并发提交时靠它配合 start_run 的幂等键保证只落一条 run。
         self._submission_lock = asyncio.Lock()
 
     async def submit(self, session_id: str, message: str, request_key: str | None = None) -> tuple[dict[str, Any], bool]:
+        """受理一条用户消息：创建运行并把用户消息落库。返回 (run, 是否新建)。"""
         if not message or not message.strip():
             raise ValueError("message_required")
         session = await self.store.get_session(session_id)
@@ -90,27 +113,34 @@ class AgentRuntime:
                 input_budget = context_window - output_reserve - self.safety_margin
                 if input_budget <= 0:
                     raise ValueError("model_context_budget_invalid")
+                # 单条消息就快撑满上下文时，把它转成资源、只把索引提示写进上下文，
+                # 让模型按需分页读取，而不是直接让这次请求超限失败。
                 if estimate_tokens(message) >= input_budget * self.soft_context_ratio:
                     resource_id = await self.resources.save(session_id, message, "text")
                     visible_message = f"完整消息已保存为资源 {resource_id}。回答前请按需使用资源查找或资源读取工具查看。"
                 await self.store.add_message(session_id, run["id"], "user", {"content": visible_message})
+                # 会话第一条消息顺带当作标题；从这里取的是原始 message，而不是被替换后的资源提示。
                 if await self.store.count_messages(session_id) == 1:
                     await self.store.set_session_title(session_id, message)
             except Exception:
+                # 准备阶段失败也要把 run 落到终态，否则会话会被永久判定为"忙碌"。
                 await self.store.finish_run(run["id"], "failed", "消息准备失败，请重试。", {"code": "input_prepare_failed"})
                 raise
         return run, created
 
     async def _model_call(self, run_id: str, model: ModelClient, messages: list[dict[str, Any]], tools: list[dict[str, Any]], tool_choice: str, *, max_attempts: int = 3, phase: str = "response", iteration: int = 0) -> dict[str, Any]:
+        """调用模型，内置重试与协作式取消。返回原始响应。"""
         last_error: Exception | None = None
         for attempt in range(max_attempts):
             current = await self.store.get_run(run_id)
+            # 调用次数上限要在这里再查一次：压缩摘要也走同一个计数，超限就整体停下。
             if not current or current["model_calls"] >= self.max_model_calls:
                 raise RuntimeError("model_call_limit")
             await self.store.increment_model_calls(run_id)
             started = time.perf_counter()
             await self.store.add_trace(run_id, "model.started", {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "tool_choice": tool_choice})
             try:
+                # 手动轮询而不是直接 await：这样在等待模型返回的过程中也能响应"停止"。
                 task = asyncio.create_task(model.complete(messages, tools, tool_choice=tool_choice))
                 while not task.done():
                     await asyncio.wait({task}, timeout=.1)
@@ -128,8 +158,10 @@ class AgentRuntime:
                 event = "model.retry" if attempt + 1 < max_attempts else "model.failed"
                 await self.store.add_trace(run_id, event, {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "code": type(exc).__name__, "detail": str(exc)[:300], "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
                 if attempt + 1 < max_attempts:
+                    # 退避 .5s → 1s，避免服务端抖动时连环重试。
                     await asyncio.sleep((.5, 1)[attempt])
             except httpx.HTTPStatusError as exc:
+                # 只对"可能自愈"的状态码重试；4xx 里的参数/鉴权错误重试没有意义，直接抛出。
                 if exc.response.status_code not in {429, 500, 502, 503, 504}:
                     raise
                 last_error = exc
@@ -140,9 +172,11 @@ class AgentRuntime:
         raise RuntimeError("model_unavailable") from last_error
 
     async def _tool_call(self, run_id: str, name: str, args: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        """执行工具（同样支持取消）。"""
         task = asyncio.create_task(self.registry.execute(name, args, context))
         while not task.done():
             await asyncio.wait({task}, timeout=.1)
+            # 本地写类工具（todo）不响应取消：它已经开了事务，中途取消会破坏写入一致性。
             if await self.store.is_cancel_requested(run_id) and name != "todo":
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -150,6 +184,7 @@ class AgentRuntime:
         return await task
 
     async def _maybe_summarize(self, run_id: str, session_id: str, manager: ContextManager, model: ModelClient, mode: str, tools: list[dict[str, Any]], summary_calls: int, iteration: int) -> int:
+        """上下文超过软水位时，把较早的轮次压缩成摘要。返回累计的压缩调用次数。"""
         bundle = await manager.prepare(session_id, tools)
         if not bundle.over_soft or summary_calls >= self.max_summary_calls:
             return summary_calls
@@ -159,10 +194,12 @@ class AgentRuntime:
         rows, covered = candidate
         previous = await self.store.latest_summary(session_id)
         summary_messages = manager.summary_messages(previous["content"] if previous else None, rows, mode == "json")
+        # 待摘要内容自身也可能超预算：不断减半，直到装得下为止（至少留一条）。
         while len(rows) > 1 and estimate_tokens(summary_messages) > manager.input_budget:
             rows = rows[: len(rows) // 2]
             covered = int(rows[-1]["seq"])
             summary_messages = manager.summary_messages(previous["content"] if previous else None, rows, mode == "json")
+        # 记录调用前的计数，用于把"摘要消耗的模型调用"也算进总预算。
         before = await self.store.get_run(run_id)
         try:
             raw = await self._model_call(
@@ -179,6 +216,7 @@ class AgentRuntime:
             after = await self.store.get_run(run_id)
             summary_calls += max(0, int(after["model_calls"]) - int(before["model_calls"])) if before and after else 0
             code = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+            # 取消与调用超限必须向上抛，其余失败只降级为"这次没压成"，不影响主流程。
             if code in {"cancelled", "model_call_limit"}:
                 raise
             await self.store.add_trace(run_id, "context.compaction_failed", {"code": code, "summary_calls": summary_calls})
@@ -186,6 +224,7 @@ class AgentRuntime:
         after = await self.store.get_run(run_id)
         summary_calls += max(0, int(after["model_calls"]) - int(before["model_calls"])) if before and after else 1
         event = parse_response(raw, mode)
+        # 摘要过长说明模型没按要求收敛，宁可不落库（保留原历史）也不要塞进一份劣质摘要。
         if isinstance(event, Final) and len(event.answer.encode("utf-8")) <= 4096:
             await self.store.save_summary(session_id, covered, event.answer)
             await self.store.add_trace(run_id, "context.compacted", {"covered_through_seq": covered, "summary_calls": summary_calls})
@@ -194,17 +233,20 @@ class AgentRuntime:
         return summary_calls
 
     async def execute(self, run_id: str) -> RunResult:
+        """带总超时的执行入口：无论走到哪个出口，都要留下终态与回答。"""
         try:
             return await asyncio.wait_for(self._execute(run_id), timeout=self.run_timeout)
         except asyncio.TimeoutError:
             answer = "本次运行已达到时间限制，已完成的工具操作仍然保留。"
             run = await self.store.get_run(run_id)
             if run:
+                # 已经超时了，这里的收尾不能再被打断，用 shield 保护落库动作。
                 await asyncio.shield(self.store.add_message(run["session_id"], run_id, "assistant", {"content": answer, "incomplete": True}))
                 await asyncio.shield(self.store.finish_run(run_id, "limit_reached", answer, {"code": "run_timeout"}))
                 await asyncio.shield(self.store.add_trace(run_id, "run.finished", {"status": "limit_reached", "code": "run_timeout"}))
             return RunResult(run_id, run["session_id"] if run else "", "limit_reached", answer, {"code": "run_timeout"})
         except Exception as exc:
+            # 兜底：把内部异常映射成用户可读的提示 + 稳定错误码，避免把原始堆栈暴露到界面。
             run = await self.store.get_run(run_id)
             session_id = run["session_id"] if run else ""
             raw_code = str(exc)
@@ -223,6 +265,7 @@ class AgentRuntime:
             return RunResult(run_id, session_id, "failed", answer, {"code": code})
 
     async def _execute(self, run_id: str) -> RunResult:
+        """四步执行循环本体。"""
         run = await self.store.get_run(run_id)
         if not run:
             raise LookupError("run_not_found")
@@ -230,6 +273,7 @@ class AgentRuntime:
         session = await self.store.get_session(session_id)
         if not session:
             raise LookupError("session_not_found")
+        # 模型在创建 run 时已快照，这里取到的就是本次运行固定使用的那个。
         model, mode, context_window, output_reserve = self.model_factory(run["model_name"])
         manager = ContextManager(self.store, context_window, output_reserve, self.safety_margin, soft_ratio=self.soft_context_ratio, hard_ratio=self.hard_context_ratio)
         tools = self.registry.definitions()
@@ -243,26 +287,34 @@ class AgentRuntime:
         try:
             while True:
                 iteration += 1
+                # 第 1 步：取消检查点。
                 if await self.store.is_cancel_requested(run_id):
                     answer = "已停止本次运行，已完成的工具操作仍然保留。"
                     await self.store.add_message(session_id, run_id, "assistant", {"content": answer})
                     await self.store.finish_run(run_id, "cancelled", answer)
                     await self.store.add_trace(run_id, "run.finished", {"status": "cancelled"})
                     return RunResult(run_id, session_id, "cancelled", answer, operations=operations)
+                # 第 2 步：按需压缩上下文。
                 summary_calls = await self._maybe_summarize(run_id, session_id, manager, model, mode, tools, summary_calls, iteration)
                 recovery_run = run_id if minimal_context else None
                 bundle = await manager.prepare(session_id, tools, repair_prompt, only_run_id=recovery_run)
                 if bundle.over_hard:
+                    # 到硬水位就必须裁剪：按轮次丢弃较早对话，回落到 target。
                     bundle = await manager.prepare(session_id, tools, repair_prompt, target_ratio=self.target_context_ratio, only_run_id=recovery_run)
                 if bundle.estimated_tokens > bundle.input_budget:
+                    # 裁完仍装不下（例如单条工具结果过大），只能明确报错，不要发出必然被拒的请求。
                     raise RuntimeError("context_too_large")
                 run_now = await self.store.get_run(run_id)
+                # 剩最后一次调用机会时禁掉工具：必须收敛到一个回答，避免"调用上限"直接失败收场。
                 tool_choice = "none" if run_now and run_now["model_calls"] >= self.max_model_calls - 1 else "auto"
                 # 协议约定放在消息末尾：紧邻生成位置，模型遵从率明显高于混在开头 system 里。
                 bundle.messages.append({"role": "system", "content": _protocol_hint(mode, tools)})
+                # 第 3 步：调用模型。
                 raw = await self._model_call(run_id, model, bundle.messages, tools, tool_choice, iteration=iteration)
                 event = parse_response(raw, mode)
                 if isinstance(event, Final):
+                    # 第 4 步之一：终答。先落一条空消息拿到 seq，再按 24 字一片更新，
+                    # 前端 SSE 就能按 seq 定位这条消息并看到逐段生长的效果。
                     initial_payload: dict[str, Any] = {"content": ""}
                     if event.decision_summary:
                         initial_payload["thinking"] = event.decision_summary.strip()
@@ -270,6 +322,7 @@ class AgentRuntime:
                     streamed = ""
                     for index in range(0, len(event.answer), 24):
                         if await self.store.is_cancel_requested(run_id):
+                            # 已流出的部分保留在库里，整体状态标记为已取消。
                             raise RuntimeError("cancelled")
                         streamed += event.answer[index:index + 24]
                         await self.store.update_message_content(session_id, assistant_seq, streamed)
@@ -279,6 +332,7 @@ class AgentRuntime:
                     await self.store.add_trace(run_id, "run.finished", {"status": "completed"})
                     return RunResult(run_id, session_id, "completed", event.answer, operations=operations)
                 if isinstance(event, Invalid):
+                    # 第 4 步之二：协议非法。记下模型原始输出（含 finish_reason/用量）便于排查。
                     repairs += 1
                     await self.store.add_trace(run_id, "model.invalid", {"code": event.code, "reason": event.message[:200], "output": _model_output_head(raw), "iteration": iteration})
                     if repairs > self.max_repairs:
@@ -291,6 +345,7 @@ class AgentRuntime:
                     continue
                 repair_prompt = None
                 minimal_context = False
+                # 第 4 步之三：工具调用。同一个 call_id 已有结果时走复用，而不是重复执行。
                 existing = await self.store.get_tool_call(run_id, event.call_id)
                 canonical_args = json.dumps(event.arguments, ensure_ascii=False, sort_keys=True)
                 if existing:
@@ -305,6 +360,7 @@ class AgentRuntime:
                     repair_prompt = "这个工具调用已经执行完成。请使用已记录的工具结果继续处理，不要重复执行。"
                     await self.store.add_trace(run_id, "tool.reused", {"call_id": event.call_id, "name": event.name, "iteration": iteration})
                 else:
+                    # 把模型这一步的工具调用原样记进历史（不是我们自己拼的），下一轮模型才能看到自己做过什么。
                     tool_payload: dict[str, Any] = {"content": event.decision_summary or None, "tool_calls": [{"id": event.call_id, "type": "function", "function": {"name": event.name, "arguments": canonical_args}}]}
                     # 思考模式要求把本轮调用的私有推理原样回传，否则下一次模型请求会被直接拒绝（400）。
                     # 它只用于协议回传，不进入界面展示，也不参与决策。
@@ -312,12 +368,15 @@ class AgentRuntime:
                         tool_payload["reasoning_content"] = event.reasoning_content[:8000]
                     await self.store.add_message(session_id, run_id, "assistant", tool_payload)
                     await self.store.add_trace(run_id, "tool.started", {"call_id": event.call_id, "name": event.name, "iteration": iteration})
+                    # 工具结果的预算按工具类型分配：检索类给得少（1%），其余给 10%，并受剩余上下文约束。
                     ratio = .02 if event.name == "resource_search" else .10
                     remaining = max(1, manager.input_budget - bundle.estimated_tokens)
                     result_budget = max(1, min(int(manager.input_budget * ratio), remaining))
                     spec = self.registry.get(event.name)
                     tool_started = time.perf_counter()
                     if spec and spec.effect == "local_write":
+                        # 会写库的工具（如待办）走"单一事务"路径：工具执行、工具调用记录、结果消息、
+                        # 轨迹事件全部挂在同一个 connection 上，要么一起成功要么一起回滚。
                         async with self.store.engine.begin() as connection:
                             context = ExecutionContext(run_id, session_id, result_token_budget=result_budget, db_connection=connection)
                             result = await self._tool_call(run_id, event.name, event.arguments, context)
@@ -327,6 +386,8 @@ class AgentRuntime:
                     else:
                         result = await self._tool_call(run_id, event.name, event.arguments, ExecutionContext(run_id, session_id, result_token_budget=result_budget))
                         result_tokens = estimate_tokens(result.__dict__)
+                        # 结果太大就转存为资源、只留一句摘要：避免一次工具调用就把上下文撑爆。
+                        # resource_read/search 本身就是为了分页读大内容，不适用这条转存规则。
                         if event.name not in {"resource_read", "resource_search"} and (result_tokens > manager.input_budget * .10 or result_tokens > remaining):
                             resource_id = await self.resources.save(session_id, json.dumps(result.__dict__, ensure_ascii=False), "tool_result")
                             result = ToolResult(True, {"resource_id": resource_id, "summary": "工具结果较大，已保存为资源，可按需读取。"}, mock=result.mock, truncated=True)
@@ -335,6 +396,7 @@ class AgentRuntime:
                         await self.store.add_trace(run_id, "tool.finished", {"call_id": event.call_id, "name": event.name, "iteration": iteration, "ok": result.ok, "error_code": result.error.get("code") if result.error else None, "duration_ms": round((time.perf_counter() - tool_started) * 1000, 2)})
                 operations.append({"call_id": event.call_id, "name": event.name, "result": result.__dict__})
         except RuntimeError as exc:
+            # 运行期内我们主动抛出的都是"已知错误码"，这里统一映射成状态与用户可读文案。
             code = str(exc)
             status = "limit_reached" if code in {"model_call_limit"} else "cancelled" if code == "cancelled" else "failed"
             answers = {
@@ -346,11 +408,13 @@ class AgentRuntime:
                 "cancelled": "已停止本次运行，已完成的工具操作仍然保留。",
             }
             answer = answers.get(code, "Agent 未能完成本次回答，请重试。")
+            # 结尾统一补一条不完整的助手消息：界面上要有明确交代，不能让对话停在半空。
             await self.store.add_message(session_id, run_id, "assistant", {"content": answer, "incomplete": True})
             await self.store.finish_run(run_id, status, answer, {"code": code})
             await self.store.add_trace(run_id, "run.finished", {"status": status, "code": code})
             return RunResult(run_id, session_id, status, answer, {"code": code}, operations)
         except Exception as exc:
+            # 未预期异常：只把异常类型名作为错误码落库，细节留在服务端日志里。
             answer = "Agent 执行失败，已完成的工具操作仍然保留，请重试。"
             await self.store.add_message(session_id, run_id, "assistant", {"content": answer, "incomplete": True})
             await self.store.finish_run(run_id, "failed", answer, {"code": type(exc).__name__})
