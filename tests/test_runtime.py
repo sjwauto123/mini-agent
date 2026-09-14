@@ -332,6 +332,28 @@ async def test_long_input_is_externalized_before_model_call(services):
     assert run["input_preview"] == original[:500]
 
 
+async def test_externalized_input_keeps_tail_intent_visible(services):
+    """超长消息外置后，写在末尾的用户意图必须仍对模型可见。
+
+    若整条消息（含末尾的问题）被一并外置，模型只看到"已保存为资源"的提示，
+    翻页预算又读不到末尾，只能答非所问或反过来追问用户要做什么。
+    """
+    model = ScriptedModel([final("ok")])
+    runtime, store, session_id = await make_runtime(services, model)
+    intent = "请用一句话总结上面这段话。"
+    original = "填充。" * 30_000 + intent
+    run, _ = await runtime.submit(session_id, original)
+    result = await runtime.execute(run["id"])
+    assert result.status == "completed"
+    user_message = (await store.list_messages(session_id))[0]["content"]
+    assert "保存为资源" in user_message
+    assert user_message.endswith(intent)
+    # 用 ensure_ascii=False：否则中文被转义成 \uXXXX，子串断言会失真。
+    sent = json.dumps(model.calls[0]["messages"], ensure_ascii=False)
+    assert original not in sent
+    assert intent in sent
+
+
 async def test_resource_read_is_budgeted_and_not_externalized_again(services):
     store, resources, registry = services
     session_id = await store.create_session()

@@ -193,6 +193,7 @@ class AgentRuntime:
         soft_context_ratio: float = .70,
         hard_context_ratio: float = .85,
         target_context_ratio: float = .55,
+        tail_context_ratio: float = .10,
         events: RunEventBus | None = None
     ) -> None:
         self.store, self.registry, self.resources = store, registry, resources
@@ -208,6 +209,9 @@ class AgentRuntime:
         self.soft_context_ratio, self.hard_context_ratio, self.target_context_ratio = (
             soft_context_ratio, hard_context_ratio, target_context_ratio
         )
+        # 超长消息外置时保留的尾部比例：用户真正的问题通常写在末尾，
+        # 若整条消息（含问题）都被外置，模型只看到"已保存为资源"的提示就无从得知要做什么。
+        self.tail_context_ratio = tail_context_ratio
         # 串行化"创建运行"这一步：并发提交时靠它配合 start_run 的幂等键保证只落一条 run。
         self._submission_lock = asyncio.Lock()
 
@@ -236,7 +240,17 @@ class AgentRuntime:
                 # 让模型按需分页读取，而不是直接让这次请求超限失败。
                 if estimate_tokens(message) >= input_budget * self.soft_context_ratio:
                     resource_id = await self.resources.save(session_id, message, "text")
-                    visible_message = f"完整消息已保存为资源 {resource_id}。回答前请按需使用资源查找或资源读取工具查看。"
+                    # 关键：连同尾部一起外置会让用户"要做什么"随正文丢失——模型只看到一句
+                    # "已保存为资源"，翻页预算又读不到末尾，只能答非所问或反过来追问用户。
+                    # 因此额外保留消息尾部（按预算折算成字符）内联，保证意图可见。
+                    tail_budget = max(1, int(input_budget * self.tail_context_ratio))
+                    tail = message[-tail_budget:] if len(message) > tail_budget else message
+                    visible_message = (
+                        f"你发送的消息过长，完整内容已保存为资源 {resource_id}，"
+                        "可按需使用资源查找或资源读取工具分页查看。\n"
+                        "以下是该消息的结尾部分，请据此判断用户意图：\n"
+                        f"{tail}"
+                    )
                 await self.store.add_message(session_id, run["id"], "user", {"content": visible_message})
                 # 会话第一条消息顺带当作标题；从这里取的是原始 message，而不是被替换后的资源提示。
                 if await self.store.count_messages(session_id) == 1:
