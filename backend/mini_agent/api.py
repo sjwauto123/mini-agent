@@ -245,10 +245,17 @@ def create_app(config: AppConfig | None = None, model_overrides: dict[str, Model
                     previous = snapshot
                 messages = await svc(request).store.list_messages(run["session_id"])
                 assistant = next((item for item in reversed(messages) if item.get("run_id") == run_id and item.get("role") == "assistant"), None)
-                content = assistant.get("content", "") if assistant else ""
-                if content != previous_message:
-                    yield f"event: message\ndata: {json.dumps({'content': content}, ensure_ascii=False)}\n\n"
-                    previous_message = content
+                # 本次运行还没有助手消息时什么都不推，否则前端会把上一条回答误当成流式目标。
+                # 载荷带 seq，前端据此精确定位要更新的那条消息，不做“最后一条助手消息”的猜测。
+                # 工具轮的正文是决策说明，结束前不当作答案流推送；只推最终回答与决策摘要。
+                if assistant is not None:
+                    content = "" if assistant.get("tool_calls") else (assistant.get("content") or "")
+                    thinking = assistant.get("thinking") or ""
+                    if content or thinking:
+                        payload = json.dumps({"seq": assistant.get("seq"), "content": content, "thinking": thinking}, ensure_ascii=False)
+                        if payload != previous_message:
+                            yield f"event: message\ndata: {payload}\n\n"
+                            previous_message = payload
                 if run["status"] in TERMINAL:
                     return
                 await asyncio.sleep(.2)
