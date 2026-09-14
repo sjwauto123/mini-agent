@@ -11,17 +11,6 @@ from typing import Any, Literal
 RunStatus = Literal["completed", "failed", "cancelled", "limit_reached", "interrupted"]
 
 @dataclass
-class RunRequest:
-    """提交一次运行所需的入参。
-
-    ``request_key`` 用于幂等去重：同一个 key 重复提交只会真正执行一次，避免用户重复点击
-    或在网络重试时产生两条回答。
-    """
-    session_id: str
-    message: str
-    request_key: str | None = None
-
-@dataclass
 class ToolResult:
     """工具执行结果。``ok=False`` 时错误细节放在 ``error``（含稳定错误码）。
 

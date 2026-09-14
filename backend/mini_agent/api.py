@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import AppConfig, load_config
-from .errors import SUBMIT_HTTP_STATUS, answer_for, error_code_of
+from .errors import KNOWN_CODES, SUBMIT_HTTP_STATUS, answer_for, error_code_of
 from .events import RunEventBus
 from .model import HttpModelClient, ModelClient
 from .runtime import AgentRuntime
