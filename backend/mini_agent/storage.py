@@ -25,6 +25,7 @@ from sqlalchemy import Column, ForeignKey, Integer, MetaData, String, Table, Tex
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from .contracts import ExecutionContext, ToolResult
+from .errors import ERROR_ANSWERS
 
 # 清理失败之类的"可继续但需要留痕"的情况走日志，不打断调用方。
 logger = logging.getLogger(__name__)
@@ -95,10 +96,25 @@ class Store:
 
         服务重启后内存里的执行任务已经不存在，这些 run 永远不会再有结果；
         留着 running 会让前端一直转圈、也会让会话被判定为忙碌而无法再发消息。
+
+        收尾必须写满三处，否则这次运行在界面上看起来像"悄无声息地断在半路"：
+        runs 的状态、执行日志的收尾事件、以及回答尚未落地时的一条说明消息。
+        三处并入同一个事务——半套收尾比不收尾更难排查。
         """
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         async with self.engine.begin() as conn:
-            await conn.execute(update(runs).where(runs.c.status.in_(["running", "cancel_requested"])).values(status="interrupted", error=json.dumps({"code": "service_restarted"}), finished_at=utc_now()))
+            # 先查再改：只有拿到具体的 run_id 与 session_id，才能给它们补轨迹与消息。
+            abandoned = (await conn.execute(select(runs.c.id, runs.c.session_id).where(runs.c.status.in_(["running", "cancel_requested"])))).fetchall()
+            if not abandoned:
+                return
+            await conn.execute(update(runs).where(runs.c.id.in_([row[0] for row in abandoned])).values(status="interrupted", error=json.dumps({"code": "service_restarted"}), finished_at=utc_now()))
+            for run_id, session_id in abandoned:
+                await self.add_trace(run_id, "run.finished", {"status": "interrupted", "code": "service_restarted"}, connection=conn)
+                # 流式输出开跑时就落了一条 incomplete 的助手消息；只在完全没有助手消息时补一条，
+                # 否则同一次运行会在界面上出现两条助手气泡。
+                spoken = await conn.scalar(select(func.count()).select_from(messages).where(messages.c.run_id == run_id, messages.c.role == "assistant"))
+                if not spoken:
+                    await self.add_message(session_id, run_id, "assistant", {"content": ERROR_ANSWERS["service_restarted"], "interrupted": True}, connection=conn)
 
     async def close(self) -> None:
         await self.engine.dispose()
