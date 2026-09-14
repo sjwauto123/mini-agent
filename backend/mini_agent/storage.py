@@ -54,6 +54,19 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _inserted_id(result: Any) -> int | None:
+    """取刚插入行的自增主键，取不到就返回 None。
+
+    不同方言（SQLite 的 lastrowid、Postgres 的 RETURNING）暴露方式不一致，
+    用 ``inserted_primary_key`` 统一取；万一某方言不提供，也只是失去层级信息，
+    不该让"记一条轨迹"整体失败。
+    """
+    try:
+        return int(result.inserted_primary_key[0])
+    except (TypeError, IndexError, KeyError, AttributeError):
+        return None
+
+
 def migrate_database(db_path: Path) -> None:
     """把数据库升级到最新迁移版本。
 
@@ -226,10 +239,6 @@ class Store:
         async with self.engine.begin() as conn:
             return await write(conn)
 
-    async def update_message_content(self, session_id: str, seq: int, content: str) -> bool:
-        """就地更新某条助手消息的正文（保留其余字段）。"""
-        return await self.update_message_fields(session_id, seq, {"content": content})
-
     async def delete_message(self, session_id: str, seq: int) -> bool:
         """删除一条消息。
 
@@ -325,14 +334,19 @@ class Store:
         async with self.engine.begin() as conn:
             await conn.execute(update(runs).where(runs.c.id == run_id).values(status=status, answer=answer, error=json.dumps(error, ensure_ascii=False) if error else None, finished_at=utc_now()))
 
-    async def add_trace(self, run_id: str, event_type: str, payload: dict[str, Any], connection: Any = None) -> None:
-        """记录一条执行轨迹。同样支持并入调用方事务，保证轨迹与业务数据一致。"""
+    async def add_trace(self, run_id: str, event_type: str, payload: dict[str, Any], connection: Any = None) -> int | None:
+        """记录一条执行轨迹，返回它的事件 id。
+
+        返回 id 是为了让埋点能把事件串成层级：调用方拿到"本轮请求模型"事件的 id 后，
+        可以把它写进后续事件的 ``payload["parent_id"]``，前端因此不必靠顺序去猜归属。
+        同样支持并入调用方事务，保证轨迹与业务数据一致（此时 id 在事务提交后才有意义）。
+        取不到自增 id 时返回 ``None``，调用方据此退化为不带层级，不影响事件本身落库。
+        """
         statement = insert(trace_events).values(run_id=run_id, event_type=event_type, payload=json.dumps(payload, ensure_ascii=False), created_at=utc_now())
         if connection is not None:
-            await connection.execute(statement)
-            return
+            return _inserted_id(await connection.execute(statement))
         async with self.engine.begin() as conn:
-            await conn.execute(statement)
+            return _inserted_id(await conn.execute(statement))
 
     async def list_trace(self, run_id: str) -> list[dict[str, Any]]:
         async with self.engine.connect() as conn:

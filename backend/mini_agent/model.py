@@ -209,7 +209,7 @@ class HttpModelClient:
         ``tool_calls`` 在流式协议里是分片下发的（同一个 index 的 name/arguments 会在多个 chunk 里续接），
         因此这里按 index 归并后再拼字符串，不能简单覆盖。
         """
-        payload: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": True}
+        payload: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": True, "stream_options": {"include_usage": True}}
         if self.mode == "native":
             payload.update({"tools": tools, "tool_choice": tool_choice, "parallel_tool_calls": False})
         else:

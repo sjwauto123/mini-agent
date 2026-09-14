@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from .context import ContextManager, estimate_tokens
-from .contracts import ExecutionContext, Final, Invalid, RunResult, ToolCall, ToolResult
+from .contracts import ExecutionContext, Final, Invalid, RunResult, ToolResult
 from .errors import ModelServiceError, answer_for, error_code_of
 from .events import RunEventBus
 from .model import ModelClient, parse_response
@@ -79,6 +79,26 @@ def _message_of(raw: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw.get("choices"), list) and raw["choices"]:
         return raw["choices"][0].get("message") or {}
     return raw
+
+
+def _usage_metrics(raw: dict[str, Any], first_token_at: float | None, started: float) -> dict[str, Any]:
+    """从响应里取出 token 用量与首字延迟，用于 ``model.finished`` 的轨迹。
+
+    字段名跟随 OpenTelemetry 的现行命名（``input_tokens`` / ``output_tokens``）——
+    ``prompt_tokens`` / ``completion_tokens`` 是被改名的那一代。
+    上游没返回 usage 时**不写这两个字段**，而不是填 0：在成本统计里"没测到"与"测到是 0"是两回事。
+    非流式调用没有"首字"可言，因此不填 ``ttft_ms``。
+    """
+    metrics: dict[str, Any] = {}
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    if isinstance(usage, dict):
+        if isinstance(usage.get("prompt_tokens"), int):
+            metrics["input_tokens"] = usage["prompt_tokens"]
+        if isinstance(usage.get("completion_tokens"), int):
+            metrics["output_tokens"] = usage["completion_tokens"]
+    if first_token_at is not None:
+        metrics["ttft_ms"] = round((first_token_at - started) * 1000, 2)
+    return metrics
 
 
 # 思考过程改由服务商的 reasoning_content 承载（界面单独呈现），因此不再要求模型把「思考：…」
@@ -165,14 +185,18 @@ class AgentRuntime:
                 raise
         return run, created
 
-    async def _model_call(self, run_id: str, model: ModelClient, messages: list[dict[str, Any]], tools: list[dict[str, Any]], tool_choice: str, *, max_attempts: int = 3, phase: str = "response", iteration: int = 0, sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None) -> dict[str, Any]:
-        """调用模型，内置重试与协作式取消。返回原始响应。
+    async def _model_call(self, run_id: str, model: ModelClient, messages: list[dict[str, Any]], tools: list[dict[str, Any]], tool_choice: str, *, max_attempts: int = 3, phase: str = "response", iteration: int = 0, sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None) -> tuple[dict[str, Any], int | None]:
+        """调用模型，内置重试与协作式取消。返回 (原始响应, 本轮 model.started 的事件 id)。
 
         传 ``sink`` 时走流式：增量到达当下就交给它（落库 + 广播），而不是等整段生成完再回放。
         不传则是一次性调用——压缩摘要走的就是这条路，摘要不需要边生成边给用户看。
         两条路共用同一套重试与取消语义，避免"流式与非流式的错误处理各写一套"。
+
+        返回事件 id 是为了让调用方把后续事件挂到"真正产生它们的那次模型请求"下面：
+        工具调用是这一轮模型决定的，若平铺在运行下就看不出它属于第几轮。
         """
         last_error: Exception | None = None
+        span_id: int | None = None
         for attempt in range(max_attempts):
             current = await self.store.get_run(run_id)
             # 调用次数上限要在这里再查一次：压缩摘要也走同一个计数，超限就整体停下。
@@ -180,7 +204,17 @@ class AgentRuntime:
                 raise RuntimeError("model_call_limit")
             await self.store.increment_model_calls(run_id)
             started = time.perf_counter()
-            await self.store.add_trace(run_id, "model.started", {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "tool_choice": tool_choice, "stream": sink is not None})
+            # 首个内容增量到达的时刻。TTFT 是流式下唯一能区分"服务慢"与"答案长"的指标：
+            # 只记总耗时时，一个长回答会让每次调用都显得一样慢。
+            first_token_at: float | None = None
+
+            def metrics(**extra: Any) -> dict[str, Any]:
+                """本轮轨迹事件的公共字段，额外字段由调用处补齐。"""
+                base: dict[str, Any] = {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "parent_id": span_id, "duration_ms": round((time.perf_counter() - started) * 1000, 2)}
+                base.update(extra)
+                return base
+
+            span_id = await self.store.add_trace(run_id, "model.started", {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "tool_choice": tool_choice, "stream": sink is not None})
             try:
                 if sink is None:
                     raw = await self._await_task(run_id, asyncio.create_task(model.complete(messages, tools, tool_choice=tool_choice)))
@@ -188,15 +222,23 @@ class AgentRuntime:
                     # 每次尝试都从零累计：上一次尝试可能已经流出去一部分，必须先让 sink 撤回它，
                     # 否则重试成功后内容会叠加成"半句 + 完整句"。
                     await sink({"type": "reset"})
-                    raw = await self._consume_stream(run_id, model, messages, tools, tool_choice, sink)
-                await self.store.add_trace(run_id, "model.finished", {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
-                return raw
+
+                    async def timed(chunk: dict[str, Any]) -> None:
+                        """记录首个增量到达的时刻，其余原样转交。"""
+                        nonlocal first_token_at
+                        if first_token_at is None and chunk.get("type") in {"content", "reasoning"} and chunk.get("text"):
+                            first_token_at = time.perf_counter()
+                        await sink(chunk)
+
+                    raw = await self._consume_stream(run_id, model, messages, tools, tool_choice, timed)
+                await self.store.add_trace(run_id, "model.finished", metrics(**_usage_metrics(raw, first_token_at, started)))
+                return raw, span_id
             except httpx.TransportError as exc:
                 # 覆盖 ConnectError、ReadError、RemoteProtocolError 等全部传输层故障；
                 # 只捕获 TimeoutException/NetworkError 会漏掉协议层错误，导致直接抛出未分类异常。
                 last_error = exc
                 event = "model.retry" if attempt + 1 < max_attempts else "model.failed"
-                await self.store.add_trace(run_id, event, {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "code": type(exc).__name__, "detail": str(exc)[:300], "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
+                await self.store.add_trace(run_id, event, metrics(code=type(exc).__name__, detail=str(exc)[:300]))
                 if attempt + 1 < max_attempts:
                     # 退避 .5s → 1s → 2s…，避免服务端抖动时连环重试。
                     delay = _backoff_delay(attempt)
@@ -208,7 +250,7 @@ class AgentRuntime:
                     raise
                 last_error = exc
                 event = "model.retry" if attempt + 1 < max_attempts else "model.failed"
-                await self.store.add_trace(run_id, event, {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "code": f"http_{exc.response.status_code}", "detail": str(exc)[:300], "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
+                await self.store.add_trace(run_id, event, metrics(code=f"http_{exc.response.status_code}", detail=str(exc)[:300]))
                 if attempt + 1 < max_attempts:
                     delay = _backoff_delay(attempt)
                     self._notify_retry(run_id, attempt + 2, delay, f"http_{exc.response.status_code}")
@@ -216,7 +258,7 @@ class AgentRuntime:
             except ModelServiceError as exc:
                 # 鉴权、请求参数、响应结构类失败：重试没有意义，带稳定错误码直接上报。
                 # 但仍要落一条 trace，否则会出现"运行明确失败、日志却查不到原因"。
-                await self.store.add_trace(run_id, "model.failed", {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "code": exc.code, "detail": exc.detail[:300], "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
+                await self.store.add_trace(run_id, "model.failed", metrics(code=exc.code, detail=exc.detail[:300]))
                 raise
         raise RuntimeError("model_unavailable") from last_error
 
@@ -340,7 +382,7 @@ class AgentRuntime:
         # 记录调用前的计数，用于把"摘要消耗的模型调用"也算进总预算。
         before = await self.store.get_run(run_id)
         try:
-            raw = await self._model_call(
+            raw, _summary_span = await self._model_call(
                 run_id,
                 model,
                 summary_messages,
@@ -491,7 +533,7 @@ class AgentRuntime:
                             logger.warning("run %s: streamed message seq=%s disappeared during flush", run_id, assistant_seq)
                     self.events.publish(run_id, {"type": "delta", "seq": assistant_seq, "content": content, "thinking": thinking})
 
-                raw = await self._model_call(run_id, model, bundle.messages, tools, tool_choice, iteration=iteration, sink=sink)
+                raw, span_id = await self._model_call(run_id, model, bundle.messages, tools, tool_choice, iteration=iteration, sink=sink)
                 event = parse_response(raw, mode)
                 if isinstance(event, Final):
                     # 第 4 步之一：终答。正文已经边收边写过了，这里用解析结果做一次权威覆盖——
@@ -517,14 +559,14 @@ class AgentRuntime:
                     await self._discard_partial(session_id, assistant_seq, run_id)
                     assistant_seq = None
                     repairs += 1
-                    await self.store.add_trace(run_id, "model.invalid", {"code": event.code, "reason": event.message[:200], "output": _model_output_head(raw), "iteration": iteration})
+                    await self.store.add_trace(run_id, "model.invalid", {"code": event.code, "reason": event.message[:200], "output": _model_output_head(raw), "iteration": iteration, "parent_id": span_id})
                     if repairs > self.max_repairs:
                         raise RuntimeError("model_protocol_error")
                     # 空白正文说明是上下文把模型带偏了，原样重试只会复现，直接换最小上下文；
                     # 其他格式错误先原样重试一次（代价更低且保留历史连贯性），最后一次再退到最小上下文。
                     minimal_context = minimal_context or event.code == "empty_response" or repairs >= self.max_repairs
                     repair_prompt = _repair_instruction(event.code, mode)
-                    await self.store.add_trace(run_id, "model.repair", {"repairs": repairs, "code": event.code, "minimal_context": minimal_context, "iteration": iteration})
+                    await self.store.add_trace(run_id, "model.repair", {"repairs": repairs, "code": event.code, "minimal_context": minimal_context, "iteration": iteration, "parent_id": span_id})
                     continue
                 repair_prompt = None
                 minimal_context = False
@@ -534,14 +576,14 @@ class AgentRuntime:
                 if existing:
                     if existing["name"] != event.name or existing["arguments"] != canonical_args:
                         repairs += 1
-                        await self.store.add_trace(run_id, "model.invalid", {"code": "tool_call_id_conflict", "iteration": iteration})
+                        await self.store.add_trace(run_id, "model.invalid", {"code": "tool_call_id_conflict", "iteration": iteration, "parent_id": span_id})
                         if repairs > self.max_repairs:
                             raise RuntimeError("model_protocol_error")
                         repair_prompt = "同一个工具调用 ID 不能对应不同的工具或参数。请使用新的调用 ID，或直接给出最终回答。"
                         continue
                     result = ToolResult(**json.loads(existing["result"]))
                     repair_prompt = "这个工具调用已经执行完成。请使用已记录的工具结果继续处理，不要重复执行。"
-                    await self.store.add_trace(run_id, "tool.reused", {"call_id": event.call_id, "name": event.name, "iteration": iteration})
+                    await self.store.add_trace(run_id, "tool.reused", {"call_id": event.call_id, "name": event.name, "iteration": iteration, "parent_id": span_id})
                 else:
                     # 把模型这一步的工具调用原样记进历史（不是我们自己拼的），下一轮模型才能看到自己做过什么。
                     tool_payload: dict[str, Any] = {"content": event.decision_summary or None, "tool_calls": [{"id": event.call_id, "type": "function", "function": {"name": event.name, "arguments": canonical_args}}]}
@@ -567,7 +609,7 @@ class AgentRuntime:
                     # 消息才知道，那期间会把决策说明当成回答渲染（与思考面板重复一遍），
                     # 而且"调用了 N 个工具"也要等整轮跑完才出现。
                     self.events.publish(run_id, {"type": "delta", "seq": recorded_seq, "content": tool_payload.get("content") or "", "thinking": tool_payload.get("thinking") or "", "tool_calls": tool_payload["tool_calls"]})
-                    await self.store.add_trace(run_id, "tool.started", {"call_id": event.call_id, "name": event.name, "iteration": iteration})
+                    await self.store.add_trace(run_id, "tool.started", {"call_id": event.call_id, "name": event.name, "iteration": iteration, "parent_id": span_id})
                     # 工具结果的预算按工具类型分配：检索类给得少（1%），其余给 10%，并受剩余上下文约束。
                     ratio = .02 if event.name == "resource_search" else .10
                     remaining = max(1, manager.input_budget - bundle.estimated_tokens)
@@ -582,7 +624,7 @@ class AgentRuntime:
                             result = await self._tool_call(run_id, event.name, event.arguments, context)
                             await self.store.save_tool_call(run_id, event.call_id, event.name, event.arguments, result, connection)
                             await self.store.add_message(session_id, run_id, "tool", {"tool_call_id": event.call_id, "name": event.name, "content": json.dumps(result.__dict__, ensure_ascii=False)}, connection)
-                            await self.store.add_trace(run_id, "tool.finished", {"call_id": event.call_id, "name": event.name, "iteration": iteration, "ok": result.ok, "error_code": result.error.get("code") if result.error else None, "duration_ms": round((time.perf_counter() - tool_started) * 1000, 2)}, connection)
+                            await self.store.add_trace(run_id, "tool.finished", {"call_id": event.call_id, "name": event.name, "iteration": iteration, "ok": result.ok, "error_code": result.error.get("code") if result.error else None, "duration_ms": round((time.perf_counter() - tool_started) * 1000, 2), "parent_id": span_id}, connection)
                     else:
                         result = await self._tool_call(run_id, event.name, event.arguments, ExecutionContext(run_id, session_id, result_token_budget=result_budget))
                         result_tokens = estimate_tokens(result.__dict__)
@@ -593,7 +635,7 @@ class AgentRuntime:
                             result = ToolResult(True, {"resource_id": resource_id, "summary": "工具结果较大，已保存为资源，可按需读取。"}, mock=result.mock, truncated=True)
                         await self.store.save_tool_call(run_id, event.call_id, event.name, event.arguments, result)
                         await self.store.add_message(session_id, run_id, "tool", {"tool_call_id": event.call_id, "name": event.name, "content": json.dumps(result.__dict__, ensure_ascii=False)})
-                        await self.store.add_trace(run_id, "tool.finished", {"call_id": event.call_id, "name": event.name, "iteration": iteration, "ok": result.ok, "error_code": result.error.get("code") if result.error else None, "duration_ms": round((time.perf_counter() - tool_started) * 1000, 2)})
+                        await self.store.add_trace(run_id, "tool.finished", {"call_id": event.call_id, "name": event.name, "iteration": iteration, "ok": result.ok, "error_code": result.error.get("code") if result.error else None, "duration_ms": round((time.perf_counter() - tool_started) * 1000, 2), "parent_id": span_id})
                 operations.append({"call_id": event.call_id, "name": event.name, "result": result.__dict__})
         except RuntimeError as exc:
             # 运行期内可预期的失败都带稳定错误码，这里统一映射成状态与用户可读文案。
