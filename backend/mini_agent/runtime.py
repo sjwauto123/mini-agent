@@ -16,12 +16,13 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 import httpx
 
-from .context import ContextManager, estimate_tokens
-from .contracts import ExecutionContext, Final, Invalid, RunResult, ToolResult
+from .context import ContextBundle, ContextManager, estimate_tokens
+from .contracts import ExecutionContext, Final, Invalid, RunResult, ToolCall, ToolResult
 from .errors import ModelServiceError, answer_for, error_code_of
 from .events import RunEventBus
 from .model import ModelClient, parse_response
@@ -134,6 +135,37 @@ def _repair_instruction(code: str, mode: str) -> str:
             "不要输出空格、换行、Markdown 代码块或任何解释文字。"
         )
     return f"你上一次响应无效（{code}）。请重新返回一个有效的最终回答，或一个有效的工具调用。不要输出其他格式。"
+
+
+@dataclass
+class _LoopState:
+    """一次运行在四步循环中跨轮次累积的可变状态。
+
+    抽成对象是为了让循环本体能拆成"每步一个方法"：否则取消检查、上下文压缩、模型调用、
+    终答/纠错/工具分发这几步要靠闭包共享十几个局部变量，读代码时很难判断谁改了谁。
+    """
+
+    run_id: str
+    session_id: str
+    model: ModelClient
+    mode: str
+    tools: list[dict[str, Any]]
+    manager: ContextManager
+    operations: list[dict[str, Any]] = field(default_factory=list)
+    # 协议纠错与上下文压缩的计数，跨轮次累计。
+    repairs: int = 0
+    summary_calls: int = 0
+    repair_prompt: str | None = None
+    # 上下文退化（长上下文下模型只返回空白正文）时，改用「只保留本轮消息」的最小上下文重试。
+    minimal_context: bool = False
+    iteration: int = 0
+    # 本轮流式输出的助手消息序号。为空表示本轮还没有落过助手消息；它同时是"可撤回"标记，
+    # 只由流式落库设置，工具调用记录不回填。
+    assistant_seq: int | None = None
+    # 本轮已流出的正文与推理，以及上一次落库的时刻（用于 150ms 节流）。
+    content: str = ""
+    thinking: str = ""
+    last_flush: float = 0.0
 
 
 class AgentRuntime:
@@ -550,7 +582,35 @@ class AgentRuntime:
             return RunResult(run_id, session_id, "failed", answer, {"code": code})
 
     async def _execute(self, run_id: str) -> RunResult:
-        """四步执行循环本体。"""
+        """四步执行循环本体：每步一个方法，状态收在 ``_LoopState`` 里。"""
+        state = await self._open_run(run_id)
+        await self.store.add_trace(run_id, "run.started", {})
+        try:
+            while True:
+                state.iteration += 1
+                # 第 1 步：取消检查点。
+                if await self.store.is_cancel_requested(run_id):
+                    return await self._finish_cancelled(state)
+                # 第 2 步：按需压缩上下文。
+                bundle, tool_choice = await self._step_context(state)
+                # 第 3 步：流式调用模型。
+                raw, span_id = await self._step_model(state, bundle, tool_choice)
+                event = parse_response(raw, state.mode)
+                # 第 4 步：按响应形态分派。
+                if isinstance(event, Final):
+                    return await self._finish_completed(state, event)
+                if isinstance(event, Invalid):
+                    await self._step_invalid(state, event, raw, span_id)
+                    continue
+                if await self._step_tool_call(state, event, span_id, bundle):
+                    continue
+        except RuntimeError as exc:
+            return await self._finish_runtime_error(state, exc)
+        except Exception as exc:
+            return await self._finish_unexpected(state, exc)
+
+    async def _open_run(self, run_id: str) -> _LoopState:
+        """取运行与模型快照，装配本轮循环的初始状态。"""
         run = await self.store.get_run(run_id)
         if not run:
             raise LookupError("run_not_found")
@@ -568,378 +628,474 @@ class AgentRuntime:
             soft_ratio=self.soft_context_ratio,
             hard_ratio=self.hard_context_ratio
         )
-        tools = self.registry.definitions()
-        repairs = summary_calls = 0
-        repair_prompt: str | None = None
-        # 上下文退化（长上下文下模型只返回空白正文）时，改用「只保留本轮消息」的最小上下文重试。
-        minimal_context = False
-        operations: list[dict[str, Any]] = []
-        iteration = 0
-        # 本轮流式输出的助手消息序号。定义在循环外，这样即使第一轮在流式开始前就失败，
-        # 下面的失败出口也能安全地读它（否则会是未绑定变量）。
-        assistant_seq: int | None = None
-        await self.store.add_trace(run_id, "run.started", {})
-        try:
-            while True:
-                iteration += 1
-                # 第 1 步：取消检查点。
-                if await self.store.is_cancel_requested(run_id):
-                    answer = "已停止本次运行，已完成的工具操作仍然保留。"
-                    await self.store.add_message(session_id, run_id, "assistant", {"content": answer})
-                    await self.store.finish_run(run_id, "cancelled", answer)
-                    await self.store.add_trace(run_id, "run.finished", {"status": "cancelled"})
-                    return RunResult(run_id, session_id, "cancelled", answer, operations=operations)
-                # 第 2 步：按需压缩上下文。
-                summary_calls = await self._maybe_summarize(
-                    run_id,
-                    session_id,
-                    manager,
-                    model,
-                    mode,
-                    tools,
-                    summary_calls,
-                    iteration
-                )
-                recovery_run = run_id if minimal_context else None
-                bundle = await manager.prepare(session_id, tools, repair_prompt, only_run_id=recovery_run)
-                if bundle.over_hard:
-                    # 到硬水位就必须裁剪：按轮次丢弃较早对话，回落到 target。
-                    bundle = await manager.prepare(
-                        session_id,
-                        tools,
-                        repair_prompt,
-                        target_ratio=self.target_context_ratio,
-                        only_run_id=recovery_run
-                    )
-                    if bundle.memory_incomplete:
-                        # 有尚未摘要的历史被临时省略：记进 trace，让"记忆缺失"可查，
-                        # 而不是只体现在模型后续回答的行为上。
-                        await self.store.add_trace(run_id, "context.trimmed", {
-                            "iteration": iteration,
-                            "estimated_tokens": bundle.estimated_tokens,
-                            "input_budget": bundle.input_budget
-                        })
-                if bundle.estimated_tokens > bundle.input_budget:
-                    # 裁完仍装不下（例如单条工具结果过大），只能明确报错，不要发出必然被拒的请求。
-                    raise RuntimeError("context_too_large")
-                run_now = await self.store.get_run(run_id)
-                # 剩最后一次调用机会时禁掉工具：必须收敛到一个回答，避免"调用上限"直接失败收场。
-                tool_choice = "none" if run_now and run_now["model_calls"] >= self.max_model_calls - 1 else "auto"
-                # 协议约定放在消息末尾：紧邻生成位置，模型遵从率明显高于混在开头 system 里。
-                bundle.messages.append({"role": "system", "content": _protocol_hint(mode, tools)})
-                # 语言约束再单独追加一条，成为模型的最后一条输入：只写在开头 SYSTEM_PROMPT
-                # 或协议提示句尾时，实测第 1 轮仍会整轮用英文推理。
-                bundle.messages.append({"role": "system", "content": LANGUAGE_HINT})
-                # 第 3 步：流式调用模型。增量在到达当下就落库并广播，前端因此是逐字生长，
-                # 而不是像过去那样"等整段生成完，再按固定步长把完整答案回放一遍"。
-                content = thinking = ""
-                assistant_seq = None
-                last_flush = 0.0
+        return _LoopState(
+            run_id=run_id,
+            session_id=session_id,
+            model=model,
+            mode=mode,
+            tools=self.registry.definitions(),
+            manager=manager
+        )
 
-                async def sink(chunk: dict[str, Any]) -> None:
-                    """把一个增量并入本轮的助手消息：广播每一片，落库按节流。"""
-                    nonlocal assistant_seq, content, thinking, last_flush
-                    kind = chunk.get("type")
-                    if kind == "reset":
-                        # 作废本轮已流出的内容（重试前调用）：撤回消息并清空累计。
-                        content = thinking = ""
-                        if assistant_seq is not None:
-                            await self.store.delete_message(session_id, assistant_seq)
-                            self.events.publish(run_id, {"type": "discard", "seq": assistant_seq})
-                            assistant_seq = None
-                        return
-                    if kind == "reasoning":
-                        thinking += chunk["text"]
-                    elif kind == "content":
-                        content += chunk["text"]
-                    else:
-                        return
-                    if assistant_seq is None:
-                        # 消息在第一个增量到达时才创建：纯工具轮（既无思考也无正文）不会留下空壳消息。
-                        # 先打上 incomplete 标记：此刻内容才流了一半，进程若在这里中断，
-                        # 这条消息不能被后续上下文当成"已完成的回答"。
-                        assistant_seq = await self.store.add_message(
-                            session_id,
-                            run_id,
-                            "assistant",
-                            {"incomplete": True}
-                        )
-                    now = time.perf_counter()
-                    # 增量可能每秒几十条，逐片写库毫无必要：广播照发（内存操作，界面实时），
-                    # 落库节流到 150ms 一次；结束前再补一次权威写入，数据库里一定是完整内容。
-                    if now - last_flush >= .15:
-                        last_flush = now
-                        if not await self.store.update_message_fields(
-                            session_id,
-                            assistant_seq,
-                            {"content": content, "thinking": thinking}
-                        ):
-                            # 消息在此刻被删掉（例如并发撤销）时不静默继续，留一条可查的线索。
-                            logger.warning(
-                                "run %s: streamed message seq=%s disappeared during flush",
-                                run_id,
-                                assistant_seq
-                            )
-                    self.events.publish(run_id, {
-                        "type": "delta",
-                        "seq": assistant_seq,
-                        "content": content,
-                        "thinking": thinking
-                    })
+    async def _finish_cancelled(self, state: _LoopState) -> RunResult:
+        """第 1 步命中：用户请求停止，已完成的操作保留。"""
+        answer = "已停止本次运行，已完成的工具操作仍然保留。"
+        await self.store.add_message(state.session_id, state.run_id, "assistant", {"content": answer})
+        await self.store.finish_run(state.run_id, "cancelled", answer)
+        await self.store.add_trace(state.run_id, "run.finished", {"status": "cancelled"})
+        return RunResult(state.run_id, state.session_id, "cancelled", answer, operations=state.operations)
 
-                raw, span_id = await self._model_call(
-                    run_id,
-                    model,
-                    bundle.messages,
-                    tools,
-                    tool_choice,
-                    iteration=iteration,
-                    sink=sink
-                )
-                event = parse_response(raw, mode)
-                if isinstance(event, Final):
-                    # 第 4 步之一：终答。正文已经边收边写过了，这里用解析结果做一次权威覆盖——
-                    # 模型若仍写了首行决策说明，会被这一写剥掉，落库正文与协议解析结果始终一致。
-                    if assistant_seq is None:
-                        # 一个字都没流出来就直接终答（例如推理没有走 reasoning_content）：补一条消息，界面不能停在半空。
-                        assistant_seq = await self.store.add_message(
-                            session_id,
-                            run_id,
-                            "assistant",
-                            {"incomplete": True}
-                        )
-                    final_thinking = thinking or event.decision_summary
-                    # 落定：清掉 incomplete——这条消息已经是一个确定的回答。
-                    # update_message_fields 会丢弃空值字段，因此 incomplete=False 等于把标记摘掉。
-                    if not await self.store.update_message_fields(session_id, assistant_seq, {
-                        "content": event.answer,
-                        "thinking": final_thinking,
-                        "incomplete": False
-                    }):
-                        # 权威写入失败：内存里的回答仍然会写进 runs.answer，但消息表是残缺的，必须留痕。
-                        logger.warning(
-                            "run %s: failed to persist final answer to message seq=%s",
-                            run_id,
-                            assistant_seq
-                        )
-                        await self.store.add_trace(
-                            run_id,
-                            "message.write_failed",
-                            {"seq": assistant_seq, "stage": "final"}
-                        )
-                    self.events.publish(run_id, {
-                        "type": "delta",
-                        "seq": assistant_seq,
-                        "content": event.answer,
-                        "thinking": final_thinking or ""
-                    })
-                    await self.store.add_trace(run_id, "assistant.delta", {
-                        "complete": True,
-                        "chars": len(event.answer),
-                        "iteration": iteration
-                    })
-                    await self.store.finish_run(run_id, "completed", event.answer)
-                    await self.store.add_trace(run_id, "run.finished", {"status": "completed"})
-                    return RunResult(run_id, session_id, "completed", event.answer, operations=operations)
-                if isinstance(event, Invalid):
-                    # 第 4 步之二：协议非法。这一轮整轮作废——已经流出去的部分必须撤回，
-                    # 否则界面上会留下一条只说了一半的幽灵回答。
-                    await self._discard_partial(session_id, assistant_seq, run_id)
-                    assistant_seq = None
-                    repairs += 1
-                    await self.store.add_trace(run_id, "model.invalid", {
-                        "code": event.code,
-                        "reason": event.message[:200],
-                        "output": _model_output_head(raw),
-                        "iteration": iteration,
-                        "parent_id": span_id
-                    })
-                    if repairs > self.max_repairs:
-                        raise RuntimeError("model_protocol_error")
-                    # 空白正文说明是上下文把模型带偏了，原样重试只会复现，直接换最小上下文；
-                    # 其他格式错误先原样重试一次（代价更低且保留历史连贯性），最后一次再退到最小上下文。
-                    minimal_context = minimal_context or event.code == "empty_response" or repairs >= self.max_repairs
-                    repair_prompt = _repair_instruction(event.code, mode)
-                    await self.store.add_trace(run_id, "model.repair", {
-                        "repairs": repairs,
-                        "code": event.code,
-                        "minimal_context": minimal_context,
-                        "iteration": iteration,
-                        "parent_id": span_id
-                    })
-                    continue
-                repair_prompt = None
-                minimal_context = False
-                # 第 4 步之三：工具调用。同一个 call_id 已有结果时走复用，而不是重复执行。
-                existing = await self.store.get_tool_call(run_id, event.call_id)
-                canonical_args = json.dumps(event.arguments, ensure_ascii=False, sort_keys=True)
-                if existing:
-                    if existing["name"] != event.name or existing["arguments"] != canonical_args:
-                        repairs += 1
-                        await self.store.add_trace(run_id, "model.invalid", {
-                            "code": "tool_call_id_conflict",
-                            "iteration": iteration,
-                            "parent_id": span_id
-                        })
-                        if repairs > self.max_repairs:
-                            raise RuntimeError("model_protocol_error")
-                        repair_prompt = "同一个工具调用 ID 不能对应不同的工具或参数。请使用新的调用 ID，或直接给出最终回答。"
-                        continue
-                    result = ToolResult(**json.loads(existing["result"]))
-                    repair_prompt = "这个工具调用已经执行完成。请使用已记录的工具结果继续处理，不要重复执行。"
-                    await self.store.add_trace(run_id, "tool.reused", {
-                        "call_id": event.call_id,
-                        "name": event.name,
-                        "iteration": iteration,
-                        "parent_id": span_id
-                    })
-                else:
-                    # 把模型这一步的工具调用原样记进历史（不是我们自己拼的），下一轮模型才能看到自己做过什么。
-                    tool_payload: dict[str, Any] = {"content": event.decision_summary or None, "tool_calls": [{
-                        "id": event.call_id,
-                        "type": "function",
-                        "function": {"name": event.name, "arguments": canonical_args}
-                    }]}
-                    # 思考模式要求把本轮调用的私有推理原样回传，否则下一次模型请求会被直接拒绝（400）。
-                    # 它只用于协议回传，不进入界面展示，也不参与决策。
-                    if event.reasoning_content:
-                        tool_payload["reasoning_content"] = event.reasoning_content[:8000]
-                    # 思考过程：把流式收下来的推理一并展示，比只留一句决策说明更接近模型实际在想什么。
-                    if thinking:
-                        tool_payload["thinking"] = thinking[:8000]
-                    if assistant_seq is None:
-                        # 模型没有产出任何增量（直接给出工具调用）：工具调用就是这一轮唯一的产物。
-                        # 这里不回填 assistant_seq：它是"流式落过库、需要时可撤回"的标记，
-                        # 而这条消息是工具调用的记录，必须一直留在历史里。
-                        recorded_seq = await self.store.add_message(session_id, run_id, "assistant", tool_payload)
-                    else:
-                        # 流式期间已经落了本轮的助手消息（含思考过程）：把工具调用补到同一条上，
-                        # 不要另起一条，否则界面上会出现"只有思考、没有下文"的空壳消息。
-                        # 这一轮到此已经有了确定结论（调用工具），同样摘掉 incomplete 标记。
-                        await self.store.update_message_fields(
-                            session_id,
-                            assistant_seq,
-                            {**tool_payload, "incomplete": False}
-                        )
-                        recorded_seq = assistant_seq
-                    # 这一轮已确定是工具调用，立刻把这个事实推给前端。否则前端要等运行结束拉全量
-                    # 消息才知道，那期间会把决策说明当成回答渲染（与思考面板重复一遍），
-                    # 而且"调用了 N 个工具"也要等整轮跑完才出现。
-                    self.events.publish(run_id, {
-                        "type": "delta",
-                        "seq": recorded_seq,
-                        "content": tool_payload.get("content") or "",
-                        "thinking": tool_payload.get("thinking") or "",
-                        "tool_calls": tool_payload["tool_calls"]
-                    })
-                    await self.store.add_trace(run_id, "tool.started", {
-                        "call_id": event.call_id,
-                        "name": event.name,
-                        "iteration": iteration,
-                        "parent_id": span_id
-                    })
-                    # 工具结果的预算按工具类型分配：检索类给得少（1%），其余给 10%，并受剩余上下文约束。
-                    ratio = .02 if event.name == "resource_search" else .10
-                    remaining = max(1, manager.input_budget - bundle.estimated_tokens)
-                    result_budget = max(1, min(int(manager.input_budget * ratio), remaining))
-                    spec = self.registry.get(event.name)
-                    tool_started = time.perf_counter()
-                    if spec and spec.effect == "local_write":
-                        # 会写库的工具（如待办）走"单一事务"路径：工具执行、工具调用记录、结果消息、
-                        # 轨迹事件全部挂在同一个 connection 上，要么一起成功要么一起回滚。
-                        async with self.store.engine.begin() as connection:
-                            context = ExecutionContext(
-                                run_id,
-                                session_id,
-                                result_token_budget=result_budget,
-                                db_connection=connection
-                            )
-                            result = await self._tool_call(run_id, event.name, event.arguments, context)
-                            await self.store.save_tool_call(
-                                run_id,
-                                event.call_id,
-                                event.name,
-                                event.arguments,
-                                result,
-                                connection
-                            )
-                            await self.store.add_message(session_id, run_id, "tool", {
-                                "tool_call_id": event.call_id,
-                                "name": event.name,
-                                "content": json.dumps(result.__dict__, ensure_ascii=False)
-                            }, connection)
-                            await self.store.add_trace(run_id, "tool.finished", {
-                                "call_id": event.call_id,
-                                "name": event.name,
-                                "iteration": iteration,
-                                "ok": result.ok,
-                                "error_code": result.error.get("code") if result.error else None,
-                                "duration_ms": round((time.perf_counter() - tool_started) * 1000, 2),
-                                "parent_id": span_id
-                            }, connection)
-                    else:
-                        result = await self._tool_call(
-                            run_id,
-                            event.name,
-                            event.arguments,
-                            ExecutionContext(run_id, session_id, result_token_budget=result_budget)
-                        )
-                        result_tokens = estimate_tokens(result.__dict__)
-                        # 结果太大就转存为资源、只留一句摘要：避免一次工具调用就把上下文撑爆。
-                        # resource_read/search 本身就是为了分页读大内容，不适用这条转存规则。
-                        if event.name not in {
-                            "resource_read",
-                            "resource_search"
-                        } and (result_tokens > manager.input_budget * .10 or result_tokens > remaining):
-                            resource_id = await self.resources.save(
-                                session_id,
-                                json.dumps(result.__dict__, ensure_ascii=False),
-                                "tool_result"
-                            )
-                            result = ToolResult(True, {
-                                "resource_id": resource_id,
-                                "summary": "工具结果较大，已保存为资源，可按需读取。"
-                            }, mock=result.mock, truncated=True)
-                        await self.store.save_tool_call(run_id, event.call_id, event.name, event.arguments, result)
-                        await self.store.add_message(session_id, run_id, "tool", {
-                            "tool_call_id": event.call_id,
-                            "name": event.name,
-                            "content": json.dumps(result.__dict__, ensure_ascii=False)
-                        })
-                        await self.store.add_trace(run_id, "tool.finished", {
-                            "call_id": event.call_id,
-                            "name": event.name,
-                            "iteration": iteration,
-                            "ok": result.ok,
-                            "error_code": result.error.get("code") if result.error else None,
-                            "duration_ms": round((time.perf_counter() - tool_started) * 1000, 2),
-                            "parent_id": span_id
-                        })
-                operations.append({"call_id": event.call_id, "name": event.name, "result": result.__dict__})
-        except RuntimeError as exc:
-            # 运行期内可预期的失败都带稳定错误码，这里统一映射成状态与用户可读文案。
-            code = error_code_of(exc)
-            status = (
-                "limit_reached" if code in {"model_call_limit"}
-                else "cancelled" if code == "cancelled"
-                else "failed"
+    async def _step_context(self, state: _LoopState) -> tuple[ContextBundle, str]:
+        """第 2 步：压缩上下文、裁剪到预算内，并给出本轮的协议提示与 tool_choice。"""
+        state.summary_calls = await self._maybe_summarize(
+            state.run_id,
+            state.session_id,
+            state.manager,
+            state.model,
+            state.mode,
+            state.tools,
+            state.summary_calls,
+            state.iteration
+        )
+        recovery_run = state.run_id if state.minimal_context else None
+        bundle = await state.manager.prepare(
+            state.session_id, state.tools, state.repair_prompt, only_run_id=recovery_run
+        )
+        if bundle.over_hard:
+            # 到硬水位就必须裁剪：按轮次丢弃较早对话，回落到 target。
+            bundle = await state.manager.prepare(
+                state.session_id,
+                state.tools,
+                state.repair_prompt,
+                target_ratio=self.target_context_ratio,
+                only_run_id=recovery_run
             )
-            answer = answer_for(code, "Agent 未能完成本次回答，请重试。")
-            # 流式输出到一半才失败（被取消、模型掉线、协议纠错耗尽）时，那条半截消息必须撤回：
-            # 否则界面上会留下一条看着像完整回答的残句，它还会被下一轮的模型当成已完成的结果。
-            await self._discard_partial(session_id, assistant_seq, run_id)
-            # 结尾统一补一条不完整的助手消息：界面上要有明确交代，不能让对话停在半空。
-            await self.store.add_message(session_id, run_id, "assistant", {"content": answer, "incomplete": True})
-            await self.store.finish_run(run_id, status, answer, {"code": code})
-            await self.store.add_trace(run_id, "run.finished", {"status": status, "code": code})
-            return RunResult(run_id, session_id, status, answer, {"code": code}, operations)
-        except Exception as exc:
-            # 未预期异常：对外只留异常类型名，堆栈必须进服务端日志，否则线上无从排查。
-            code = error_code_of(exc)
-            logger.exception("run %s failed with unexpected error", run_id)
-            answer = "Agent 执行失败，已完成的工具操作仍然保留，请重试。"
-            await self._discard_partial(session_id, assistant_seq, run_id)
-            await self.store.add_message(session_id, run_id, "assistant", {"content": answer, "incomplete": True})
-            await self.store.finish_run(run_id, "failed", answer, {"code": code})
-            await self.store.add_trace(run_id, "run.finished", {"status": "failed", "code": code})
-            return RunResult(run_id, session_id, "failed", answer, {"code": code}, operations)
+            if bundle.memory_incomplete:
+                # 有尚未摘要的历史被临时省略：记进 trace，让"记忆缺失"可查，
+                # 而不是只体现在模型后续回答的行为上。
+                await self.store.add_trace(state.run_id, "context.trimmed", {
+                    "iteration": state.iteration,
+                    "estimated_tokens": bundle.estimated_tokens,
+                    "input_budget": bundle.input_budget
+                })
+        if bundle.estimated_tokens > bundle.input_budget:
+            # 裁完仍装不下（例如单条工具结果过大），只能明确报错，不要发出必然被拒的请求。
+            raise RuntimeError("context_too_large")
+        run_now = await self.store.get_run(state.run_id)
+        # 剩最后一次调用机会时禁掉工具：必须收敛到一个回答，避免"调用上限"直接失败收场。
+        if run_now and run_now["model_calls"] >= self.max_model_calls - 1:
+            tool_choice = "none"
+        else:
+            tool_choice = "auto"
+        # 协议约定放在消息末尾：紧邻生成位置，模型遵从率明显高于混在开头 system 里。
+        bundle.messages.append({"role": "system", "content": _protocol_hint(state.mode, state.tools)})
+        # 语言约束再单独追加一条，成为模型的最后一条输入：只写在开头 SYSTEM_PROMPT
+        # 或协议提示句尾时，实测第 1 轮仍会整轮用英文推理。
+        bundle.messages.append({"role": "system", "content": LANGUAGE_HINT})
+        return bundle, tool_choice
+
+    async def _step_model(
+        self,
+        state: _LoopState,
+        bundle: ContextBundle,
+        tool_choice: str
+    ) -> tuple[dict[str, Any], int | None]:
+        """第 3 步：流式调用模型。
+
+        增量在到达当下就落库并广播，前端因此是逐字生长，而不是像过去那样
+        "等整段生成完，再按固定步长把完整答案回放一遍"。
+        """
+        state.content = ""
+        state.thinking = ""
+        state.assistant_seq = None
+        state.last_flush = 0.0
+
+        async def sink(chunk: dict[str, Any]) -> None:
+            """把一个增量并入本轮的助手消息：广播每一片，落库按节流。"""
+            kind = chunk.get("type")
+            if kind == "reset":
+                # 作废本轮已流出的内容（重试前调用）：撤回消息并清空累计。
+                state.content = ""
+                state.thinking = ""
+                if state.assistant_seq is not None:
+                    await self.store.delete_message(state.session_id, state.assistant_seq)
+                    self.events.publish(state.run_id, {"type": "discard", "seq": state.assistant_seq})
+                    state.assistant_seq = None
+                return
+            if kind == "reasoning":
+                state.thinking += chunk["text"]
+            elif kind == "content":
+                state.content += chunk["text"]
+            else:
+                return
+            if state.assistant_seq is None:
+                # 消息在第一个增量到达时才创建：纯工具轮（既无思考也无正文）不会留下空壳消息。
+                # 先打上 incomplete 标记：此刻内容才流了一半，进程若在这里中断，
+                # 这条消息不能被后续上下文当成"已完成的回答"。
+                state.assistant_seq = await self.store.add_message(
+                    state.session_id,
+                    state.run_id,
+                    "assistant",
+                    {"incomplete": True}
+                )
+            now = time.perf_counter()
+            # 增量可能每秒几十条，逐片写库毫无必要：广播照发（内存操作，界面实时），
+            # 落库节流到 150ms 一次；结束前再补一次权威写入，数据库里一定是完整内容。
+            if now - state.last_flush >= .15:
+                state.last_flush = now
+                if not await self.store.update_message_fields(
+                    state.session_id,
+                    state.assistant_seq,
+                    {"content": state.content, "thinking": state.thinking}
+                ):
+                    # 消息在此刻被删掉（例如并发撤销）时不静默继续，留一条可查的线索。
+                    logger.warning(
+                        "run %s: streamed message seq=%s disappeared during flush",
+                        state.run_id,
+                        state.assistant_seq
+                    )
+            self.events.publish(state.run_id, {
+                "type": "delta",
+                "seq": state.assistant_seq,
+                "content": state.content,
+                "thinking": state.thinking
+            })
+
+        return await self._model_call(
+            state.run_id,
+            state.model,
+            bundle.messages,
+            state.tools,
+            tool_choice,
+            iteration=state.iteration,
+            sink=sink
+        )
+
+    async def _finish_completed(self, state: _LoopState, event: Final) -> RunResult:
+        """第 4 步之一：终答。"""
+        # 正文已经边收边写过了，这里用解析结果做一次权威覆盖——模型若仍写了首行决策说明，
+        # 会被这一写剥掉，落库正文与协议解析结果始终一致。
+        if state.assistant_seq is None:
+            # 一个字都没流出来就直接终答（例如推理没有走 reasoning_content）：
+            # 补一条消息，界面不能停在半空。
+            state.assistant_seq = await self.store.add_message(
+                state.session_id,
+                state.run_id,
+                "assistant",
+                {"incomplete": True}
+            )
+        final_thinking = state.thinking or event.decision_summary
+        # 落定：清掉 incomplete——这条消息已经是一个确定的回答。
+        # update_message_fields 会丢弃空值字段，因此 incomplete=False 等于把标记摘掉。
+        if not await self.store.update_message_fields(state.session_id, state.assistant_seq, {
+            "content": event.answer,
+            "thinking": final_thinking,
+            "incomplete": False
+        }):
+            # 权威写入失败：内存里的回答仍然会写进 runs.answer，但消息表是残缺的，必须留痕。
+            logger.warning(
+                "run %s: failed to persist final answer to message seq=%s",
+                state.run_id,
+                state.assistant_seq
+            )
+            await self.store.add_trace(
+                state.run_id,
+                "message.write_failed",
+                {"seq": state.assistant_seq, "stage": "final"}
+            )
+        self.events.publish(state.run_id, {
+            "type": "delta",
+            "seq": state.assistant_seq,
+            "content": event.answer,
+            "thinking": final_thinking or ""
+        })
+        await self.store.add_trace(state.run_id, "assistant.delta", {
+            "complete": True,
+            "chars": len(event.answer),
+            "iteration": state.iteration
+        })
+        await self.store.finish_run(state.run_id, "completed", event.answer)
+        await self.store.add_trace(state.run_id, "run.finished", {"status": "completed"})
+        return RunResult(state.run_id, state.session_id, "completed", event.answer, operations=state.operations)
+
+    async def _step_invalid(
+        self,
+        state: _LoopState,
+        event: Invalid,
+        raw: dict[str, Any],
+        span_id: int | None
+    ) -> None:
+        """第 4 步之二：协议非法。
+
+        这一轮整轮作废——已经流出去的部分必须撤回，否则界面上会留下一条只说了一半的幽灵回答。
+        """
+        await self._discard_partial(state.session_id, state.assistant_seq, state.run_id)
+        state.assistant_seq = None
+        state.repairs += 1
+        await self.store.add_trace(state.run_id, "model.invalid", {
+            "code": event.code,
+            "reason": event.message[:200],
+            "output": _model_output_head(raw),
+            "iteration": state.iteration,
+            "parent_id": span_id
+        })
+        if state.repairs > self.max_repairs:
+            raise RuntimeError("model_protocol_error")
+        # 空白正文说明是上下文把模型带偏了，原样重试只会复现，直接换最小上下文；
+        # 其他格式错误先原样重试一次（代价更低且保留历史连贯性），最后一次再退到最小上下文。
+        state.minimal_context = (
+            state.minimal_context or event.code == "empty_response" or state.repairs >= self.max_repairs
+        )
+        state.repair_prompt = _repair_instruction(event.code, state.mode)
+        await self.store.add_trace(state.run_id, "model.repair", {
+            "repairs": state.repairs,
+            "code": event.code,
+            "minimal_context": state.minimal_context,
+            "iteration": state.iteration,
+            "parent_id": span_id
+        })
+
+    async def _step_tool_call(
+        self,
+        state: _LoopState,
+        event: ToolCall,
+        span_id: int | None,
+        bundle: ContextBundle
+    ) -> bool:
+        """第 4 步之三：工具调用。返回 True 表示本轮不执行工具、直接进入下一轮。"""
+        state.repair_prompt = None
+        state.minimal_context = False
+        existing = await self.store.get_tool_call(state.run_id, event.call_id)
+        canonical_args = json.dumps(event.arguments, ensure_ascii=False, sort_keys=True)
+        if existing:
+            # 同一个 call_id 已有结果时走复用，而不是重复执行。
+            if existing["name"] != event.name or existing["arguments"] != canonical_args:
+                state.repairs += 1
+                await self.store.add_trace(state.run_id, "model.invalid", {
+                    "code": "tool_call_id_conflict",
+                    "iteration": state.iteration,
+                    "parent_id": span_id
+                })
+                if state.repairs > self.max_repairs:
+                    raise RuntimeError("model_protocol_error")
+                state.repair_prompt = (
+                    "同一个工具调用 ID 不能对应不同的工具或参数。请使用新的调用 ID，或直接给出最终回答。"
+                )
+                return True
+            result = ToolResult(**json.loads(existing["result"]))
+            state.repair_prompt = "这个工具调用已经执行完成。请使用已记录的工具结果继续处理，不要重复执行。"
+            await self.store.add_trace(state.run_id, "tool.reused", {
+                "call_id": event.call_id,
+                "name": event.name,
+                "iteration": state.iteration,
+                "parent_id": span_id
+            })
+        else:
+            result = await self._run_tool(state, event, canonical_args, span_id, bundle)
+        state.operations.append({"call_id": event.call_id, "name": event.name, "result": result.__dict__})
+        return False
+
+    async def _run_tool(
+        self,
+        state: _LoopState,
+        event: ToolCall,
+        canonical_args: str,
+        span_id: int | None,
+        bundle: ContextBundle
+    ) -> ToolResult:
+        """记录本轮调用、算出结果预算、执行工具并把结果落库。"""
+        await self._record_tool_call(state, event, canonical_args, span_id)
+        # 工具结果的预算按工具类型分配：检索类给得少（2%），其余给 10%，并受剩余上下文约束。
+        ratio = .02 if event.name == "resource_search" else .10
+        remaining = max(1, state.manager.input_budget - bundle.estimated_tokens)
+        result_budget = max(1, min(int(state.manager.input_budget * ratio), remaining))
+        started = time.perf_counter()
+        spec = self.registry.get(event.name)
+        if spec and spec.effect == "local_write":
+            return await self._run_local_write_tool(state, event, result_budget, started, span_id)
+        return await self._run_plain_tool(state, event, result_budget, remaining, started, span_id)
+
+    async def _record_tool_call(
+        self,
+        state: _LoopState,
+        event: ToolCall,
+        canonical_args: str,
+        span_id: int | None
+    ) -> None:
+        """把本轮的模型工具调用原样写进历史并推给前端（此时还没执行工具）。"""
+        # 把模型这一步的工具调用原样记进历史（不是我们自己拼的），下一轮模型才能看到自己做过什么。
+        tool_payload: dict[str, Any] = {"content": event.decision_summary or None, "tool_calls": [{
+            "id": event.call_id,
+            "type": "function",
+            "function": {"name": event.name, "arguments": canonical_args}
+        }]}
+        # 思考模式要求把本轮调用的私有推理原样回传，否则下一次模型请求会被直接拒绝（400）。
+        # 它只用于协议回传，不进入界面展示，也不参与决策。
+        if event.reasoning_content:
+            tool_payload["reasoning_content"] = event.reasoning_content[:8000]
+        # 思考过程：把流式收下来的推理一并展示，比只留一句决策说明更接近模型实际在想什么。
+        if state.thinking:
+            tool_payload["thinking"] = state.thinking[:8000]
+        if state.assistant_seq is None:
+            # 模型没有产出任何增量（直接给出工具调用）：工具调用就是这一轮唯一的产物。
+            # 这里不回填 assistant_seq：它是"流式落过库、需要时可撤回"的标记，
+            # 而这条消息是工具调用的记录，必须一直留在历史里。
+            recorded_seq = await self.store.add_message(state.session_id, state.run_id, "assistant", tool_payload)
+        else:
+            # 流式期间已经落了本轮的助手消息（含思考过程）：把工具调用补到同一条上，
+            # 不要另起一条，否则界面上会出现"只有思考、没有下文"的空壳消息。
+            # 这一轮到此已经有了确定结论（调用工具），同样摘掉 incomplete 标记。
+            await self.store.update_message_fields(
+                state.session_id,
+                state.assistant_seq,
+                {**tool_payload, "incomplete": False}
+            )
+            recorded_seq = state.assistant_seq
+        # 这一轮已确定是工具调用，立刻把这个事实推给前端。否则前端要等运行结束拉全量
+        # 消息才知道，那期间会把决策说明当成回答渲染（与思考面板重复一遍），
+        # 而且"调用了 N 个工具"也要等整轮跑完才出现。
+        self.events.publish(state.run_id, {
+            "type": "delta",
+            "seq": recorded_seq,
+            "content": tool_payload.get("content") or "",
+            "thinking": tool_payload.get("thinking") or "",
+            "tool_calls": tool_payload["tool_calls"]
+        })
+        await self.store.add_trace(state.run_id, "tool.started", {
+            "call_id": event.call_id,
+            "name": event.name,
+            "iteration": state.iteration,
+            "parent_id": span_id
+        })
+
+    async def _run_local_write_tool(
+        self,
+        state: _LoopState,
+        event: ToolCall,
+        result_budget: int,
+        started: float,
+        span_id: int | None
+    ) -> ToolResult:
+        """会写库的工具（如待办）走"单一事务"路径。
+
+        工具执行、工具调用记录、结果消息、轨迹事件全部挂在同一个 connection 上，
+        要么一起成功要么一起回滚。
+        """
+        async with self.store.engine.begin() as connection:
+            context = ExecutionContext(
+                state.run_id,
+                state.session_id,
+                result_token_budget=result_budget,
+                db_connection=connection
+            )
+            result = await self._tool_call(state.run_id, event.name, event.arguments, context)
+            await self.store.save_tool_call(
+                state.run_id,
+                event.call_id,
+                event.name,
+                event.arguments,
+                result,
+                connection
+            )
+            await self.store.add_message(state.session_id, state.run_id, "tool", {
+                "tool_call_id": event.call_id,
+                "name": event.name,
+                "content": json.dumps(result.__dict__, ensure_ascii=False)
+            }, connection)
+            await self.store.add_trace(state.run_id, "tool.finished", {
+                "call_id": event.call_id,
+                "name": event.name,
+                "iteration": state.iteration,
+                "ok": result.ok,
+                "error_code": result.error.get("code") if result.error else None,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                "parent_id": span_id
+            }, connection)
+        return result
+
+    async def _run_plain_tool(
+        self,
+        state: _LoopState,
+        event: ToolCall,
+        result_budget: int,
+        remaining: int,
+        started: float,
+        span_id: int | None
+    ) -> ToolResult:
+        """只读工具：单独提交；结果过大时转存为资源，只留一句摘要回填上下文。"""
+        result = await self._tool_call(
+            state.run_id,
+            event.name,
+            event.arguments,
+            ExecutionContext(state.run_id, state.session_id, result_token_budget=result_budget)
+        )
+        result_tokens = estimate_tokens(result.__dict__)
+        # 结果太大就转存为资源、只留一句摘要：避免一次工具调用就把上下文撑爆。
+        # resource_read/search 本身就是为了分页读大内容，不适用这条转存规则。
+        if event.name not in {"resource_read", "resource_search"} and (
+            result_tokens > state.manager.input_budget * .10 or result_tokens > remaining
+        ):
+            resource_id = await self.resources.save(
+                state.session_id,
+                json.dumps(result.__dict__, ensure_ascii=False),
+                "tool_result"
+            )
+            result = ToolResult(True, {
+                "resource_id": resource_id,
+                "summary": "工具结果较大，已保存为资源，可按需读取。"
+            }, mock=result.mock, truncated=True)
+        await self.store.save_tool_call(state.run_id, event.call_id, event.name, event.arguments, result)
+        await self.store.add_message(state.session_id, state.run_id, "tool", {
+            "tool_call_id": event.call_id,
+            "name": event.name,
+            "content": json.dumps(result.__dict__, ensure_ascii=False)
+        })
+        await self.store.add_trace(state.run_id, "tool.finished", {
+            "call_id": event.call_id,
+            "name": event.name,
+            "iteration": state.iteration,
+            "ok": result.ok,
+            "error_code": result.error.get("code") if result.error else None,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            "parent_id": span_id
+        })
+        return result
+
+    async def _finish_runtime_error(self, state: _LoopState, exc: RuntimeError) -> RunResult:
+        """运行期内可预期的失败都带稳定错误码，这里统一映射成状态与用户可读文案。"""
+        code = error_code_of(exc)
+        status = (
+            "limit_reached" if code in {"model_call_limit"}
+            else "cancelled" if code == "cancelled"
+            else "failed"
+        )
+        answer = answer_for(code, "Agent 未能完成本次回答，请重试。")
+        # 流式输出到一半才失败（被取消、模型掉线、协议纠错耗尽）时，那条半截消息必须撤回：
+        # 否则界面上会留下一条看着像完整回答的残句，它还会被下一轮的模型当成已完成的结果。
+        await self._discard_partial(state.session_id, state.assistant_seq, state.run_id)
+        # 结尾统一补一条不完整的助手消息：界面上要有明确交代，不能让对话停在半空。
+        await self.store.add_message(
+            state.session_id,
+            state.run_id,
+            "assistant",
+            {"content": answer, "incomplete": True}
+        )
+        await self.store.finish_run(state.run_id, status, answer, {"code": code})
+        await self.store.add_trace(state.run_id, "run.finished", {"status": status, "code": code})
+        return RunResult(state.run_id, state.session_id, status, answer, {"code": code}, state.operations)
+
+    async def _finish_unexpected(self, state: _LoopState, exc: Exception) -> RunResult:
+        """未预期异常：对外只留异常类型名，堆栈必须进服务端日志，否则线上无从排查。"""
+        code = error_code_of(exc)
+        logger.exception("run %s failed with unexpected error", state.run_id)
+        answer = "Agent 执行失败，已完成的工具操作仍然保留，请重试。"
+        await self._discard_partial(state.session_id, state.assistant_seq, state.run_id)
+        await self.store.add_message(
+            state.session_id,
+            state.run_id,
+            "assistant",
+            {"content": answer, "incomplete": True}
+        )
+        await self.store.finish_run(state.run_id, "failed", answer, {"code": code})
+        await self.store.add_trace(state.run_id, "run.finished", {"status": "failed", "code": code})
+        return RunResult(state.run_id, state.session_id, "failed", answer, {"code": code}, state.operations)
