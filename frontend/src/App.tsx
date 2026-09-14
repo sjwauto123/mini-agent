@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   AlertCircle, Bot, BrainCircuit, CheckCircle2, ChevronDown, CircleDashed,
-  ListTree, Menu, MessageSquare, Plus, Send, Square, Wrench, X,
+  ListTree, Menu, MessageSquare, Plus, Send, Square, Trash2, Wrench, X,
 } from 'lucide-react'
 
 type Model = { name: string; model: string; mode: string; context_window: number }
-type Session = { id: string; model_name: string; timezone: string; created_at: string }
-type Message = { role: string; content?: string; seq: number; tool_calls?: unknown[]; name?: string }
+type Session = { id: string; model_name: string; timezone: string; title: string | null; created_at: string }
+type Message = { role: string; content?: string; thinking?: string; seq: number; tool_calls?: unknown[]; name?: string }
 type Run = { id: string; status: string; answer?: string; input_preview?: string; error?: { code: string }; model_calls?: number; created_at?: string; finished_at?: string }
 type TraceItem = { id: number; event_type: string; created_at: string; payload: Record<string, unknown> }
 type SessionTraceItem = TraceItem & { run_id: string }
@@ -127,6 +127,7 @@ const tracePresentation = (item: TraceItem) => {
     case 'model.retry': return { icon: AlertCircle, tone: 'warning', title: '模型请求重试', description: `请求未成功，正在自动重试。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: duration }
     case 'model.failed': return { icon: AlertCircle, tone: 'danger', title: '模型请求失败', description: `模型服务请求失败。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: duration }
     case 'model.invalid': return { icon: AlertCircle, tone: 'warning', title: '模型响应格式修复', description: `响应格式不符合协议，Agent 将要求模型重新返回。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: iteration }
+    case 'assistant.delta': return { icon: Send, tone: 'active', title: payload.complete ? '回答输出完成' : '输出回答片段', description: 'Agent 正在把最终回答分片推送给前端。', meta: `${String(payload.content ?? '').length} 字` }
     case 'tool.started': return { icon: Wrench, tone: 'active', title: `调用工具：${TOOL_NAMES[String(payload.name)] || payload.name}`, description: '模型选择了工具，正在执行并等待结果。', meta: iteration }
     case 'tool.finished': return { icon: payload.ok ? CheckCircle2 : AlertCircle, tone: payload.ok ? 'success' : 'danger', title: `工具${payload.ok ? '执行完成' : '执行失败'}：${TOOL_NAMES[String(payload.name)] || payload.name}`, description: payload.ok ? '工具结果已写入上下文，Agent 将继续判断下一步。' : `工具返回错误：${detailMessage(payload.error_code)}`, meta: duration }
     case 'tool.reused': return { icon: Wrench, tone: 'success', title: `复用工具结果：${TOOL_NAMES[String(payload.name)] || payload.name}`, description: '检测到相同调用，直接使用已保存的结果。', meta: iteration }
@@ -180,10 +181,15 @@ export default function App() {
   const [expandedTraceRun, setExpandedTraceRun] = useState<string | null>(null)
   const [view, setView] = useState<View>('chat')
   const [sidebar, setSidebar] = useState(false)
+  const [sessionsCollapsed, setSessionsCollapsed] = useState(() => {
+    try { return localStorage.getItem('mini-agent:sessions-collapsed') === '1' } catch { return false }
+  })
   const [error, setError] = useState('')
   const endRef = useRef<HTMLDivElement>(null)
   const selectedRef = useRef(selected)
   const eventSourceRef = useRef<EventSource | null>(null)
+  // 历史加载的代次：发送消息时递增，作废仍在飞行中的加载，避免它用旧快照覆盖本轮乐观更新的消息。
+  const messagesLoadRef = useRef(0)
 
   const current = sessions.find(item => item.id === selected)
   const busy = Boolean(run && !TERMINAL_STATUSES.has(run.status))
@@ -191,7 +197,10 @@ export default function App() {
   const selectSession = (id: string) => {
     eventSourceRef.current?.close(); eventSourceRef.current = null; selectedRef.current = id
     setSelected(id); setSidebar(false); setMessages([]); setRun(null); setRuns([]); setTrace([]); setExpandedTraceRun(null); setView('chat'); setError('')
-    const url = new URL(location.href); url.searchParams.set('session', id); history.replaceState(null, '', url)
+    const url = new URL(location.href)
+    if (id) url.searchParams.set('session', id)
+    else url.searchParams.delete('session')
+    history.replaceState(null, '', url)
   }
   const loadSessions = async () => {
     const [nextModels, nextSessions] = await Promise.all([api<Model[]>('/api/models'), api<Session[]>('/api/sessions')])
@@ -200,8 +209,11 @@ export default function App() {
   }
   const loadMessages = async (id: string) => {
     if (!id) return
+    const generation = ++messagesLoadRef.current
     const nextMessages = await api<Message[]>(`/api/sessions/${id}/messages`)
-    if (selectedRef.current === id) setMessages(nextMessages)
+    // 只有当会话没切换、且期间没有发生新的加载或发送时，才允许用服务端历史覆盖本地状态。
+    if (selectedRef.current !== id || generation !== messagesLoadRef.current) return
+    setMessages(nextMessages)
   }
   const loadRuns = async (id: string) => {
     const nextRuns = await api<Run[]>(`/api/sessions/${id}/runs`)
@@ -234,11 +246,16 @@ export default function App() {
     })
     source.addEventListener('message', event => {
       if (selectedRef.current !== sessionId) return
-      const content = JSON.parse((event as MessageEvent).data).content || ''
+      const payload = JSON.parse((event as MessageEvent).data) as { seq?: number; content?: string; thinking?: string }
+      const seq = payload.seq
+      // 只更新服务端指明的那条消息；不做“最后一条助手消息”的猜测，否则会把上一条回答覆盖掉。
+      if (typeof seq !== 'number') return
+      const content = payload.content || ''
+      const thinking = payload.thinking || ''
       setMessages(current => {
-        const index = [...current].map((item, itemIndex) => item.role === 'assistant' && !item.tool_calls ? itemIndex : -1).filter(itemIndex => itemIndex >= 0).pop()
-        if (index === undefined) return [...current, { role: 'assistant', content, seq: Date.now() }]
-        return current.map((item, itemIndex) => itemIndex === index ? { ...item, content } : item)
+        const index = current.findIndex(item => item.seq === seq)
+        if (index < 0) return [...current, { role: 'assistant', content, thinking, seq }]
+        return current.map((item, itemIndex) => itemIndex === index ? { ...item, content, thinking: thinking || item.thinking } : item)
       })
     })
   }
@@ -255,6 +272,9 @@ export default function App() {
   useEffect(() => { if (selected) Promise.all([loadMessages(selected), loadRuns(selected), restoreRun(selected)]).catch(e => setError(e.message)) }, [selected])
   useEffect(() => { if (view === 'chat') endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, run, view])
   useEffect(() => () => eventSourceRef.current?.close(), [])
+  useEffect(() => {
+    try { localStorage.setItem('mini-agent:sessions-collapsed', sessionsCollapsed ? '1' : '0') } catch {}
+  }, [sessionsCollapsed])
 
   const createSession = async () => {
     if (!models[0]) { setError(errorMessage('model_not_configured')); return }
@@ -270,12 +290,24 @@ export default function App() {
       await loadSessions()
     } catch (e) { setError((e as Error).message) }
   }
+  const deleteSession = async (item: Session) => {
+    const label = item.title || '新会话'
+    if (!window.confirm(`确定删除会话「${label}」吗？该操作不可恢复。`)) return
+    try {
+      await api(`/api/sessions/${item.id}`, { method: 'DELETE' })
+      const remaining = sessions.filter(s => s.id !== item.id)
+      setSessions(remaining)
+      if (item.id === selected) selectSession(remaining[0]?.id || '')
+    } catch (e) { setError((e as Error).message) }
+  }
   const send = async () => {
     const message = draft.trim(); if (!selected || !message || busy) return
     const sessionId = selected; setError('')
     try {
       const result = await api<{run_id: string}>(`/api/sessions/${sessionId}/runs`, { method: 'POST', body: JSON.stringify({ message, request_key: crypto.randomUUID() }) })
       if (selectedRef.current !== sessionId) return
+      // 作废可能仍在飞行中的历史加载，否则它返回的空快照会把刚发出的这条消息抹掉。
+      messagesLoadRef.current += 1
       setDraft(''); setMessages(old => [...old, { role: 'user', content: message, seq: Date.now() }]); setRun({ id: result.run_id, status: 'running' }); watchRun(result.run_id, sessionId)
     } catch (e) { setError((e as Error).message) }
   }
@@ -288,24 +320,46 @@ export default function App() {
         <button className={`module-item ${view === 'chat' ? 'active' : ''}`} onClick={() => { setView('chat'); setSidebar(false) }}><MessageSquare size={16}/><span>问答</span></button>
         <button className={`module-item ${view === 'trace' ? 'active' : ''}`} onClick={() => { setView('trace'); setSidebar(false); if (selected) loadTrace('', selected).catch(e => setError(e.message)) }} disabled={!selected}><ListTree size={16}/><span>执行日志</span>{runs.length > 0 && <b className="module-count">{runs.length}</b>}</button>
       </nav>
-      <div className="sidebar-label">会话</div>
-      <nav className="session-nav" aria-label="会话列表">
-        {sessions.map((item, index) => <button className={`session-item ${item.id === selected ? 'active' : ''}`} key={item.id} onClick={() => selectSession(item.id)}>
-          <MessageSquare size={16}/><span><b>{index === 0 ? '新会话' : `会话 ${sessions.length - index}`}</b><small>{item.model_name}</small></span>
-        </button>)}
-      </nav>
+      <div className={`sidebar-label sessions-label ${sessionsCollapsed ? 'collapsed' : ''}`}>
+        <button className="session-toggle" onClick={() => setSessionsCollapsed(c => !c)} aria-expanded={!sessionsCollapsed} aria-controls="session-list" title={sessionsCollapsed ? '展开会话列表' : '收起会话列表'}>
+          <ChevronDown size={14}/><span>会话</span><em>{sessions.length}</em>
+        </button>
+      </div>
+      {!sessionsCollapsed && <nav className="session-nav" id="session-list" aria-label="会话列表">
+        {sessions.map(item => <div className={`session-item ${item.id === selected ? 'active' : ''}`} key={item.id}>
+          <button className="session-select" onClick={() => selectSession(item.id)}>
+            <MessageSquare size={16}/><span><b>{item.title || '新会话'}</b><small>{item.model_name}</small></span>
+          </button>
+          <button className="session-delete" onClick={() => deleteSession(item)} title="删除会话" aria-label="删除会话"><Trash2 size={14}/></button>
+        </div>)}
+      </nav>}
       <div className="local-badge"><span/>本机模式</div>
     </aside>
     <main className={`workspace ${view === 'trace' ? 'trace-workspace' : ''}`}>
       <header>
         <button className="icon mobile" onClick={() => setSidebar(true)} title="打开会话"><Menu size={19}/></button>
-        <div className="session-heading"><h1>{view === 'trace' ? '执行日志' : current ? '新对话' : 'Mini Agent'}</h1><p>{view === 'trace' ? '当前会话的全部执行链路' : current ? `会话 ${current.id.slice(0, 8)}` : '等待创建会话'}</p></div>
+        <div className="session-heading"><h1>{view === 'trace' ? '执行日志' : current ? (current.title || '新对话') : 'Mini Agent'}</h1><p>{view === 'trace' ? '当前会话的全部执行链路' : current ? `会话 ${current.id.slice(0, 8)}` : '等待创建会话'}</p></div>
       </header>
 
       {view === 'chat' && <section className="conversation">
         {!selected && <div className="empty"><span><Bot size={25}/></span><h2>Mini Agent</h2><p>创建一个会话开始。</p><button onClick={createSession}><Plus size={17}/>新建会话</button></div>}
-        {selected && messages.filter(message => message.role !== 'tool' && message.content).length === 0 && <div className="empty"><span><MessageSquare size={24}/></span><h2>有什么可以帮你？</h2><p>发送问题，Agent 会自主判断是否调用工具。</p></div>}
-        {messages.filter(message => message.role !== 'tool' && message.content && !(message.role === 'assistant' && message.tool_calls)).map(message => <article key={`${message.seq}-${message.role}`} className={`message ${message.role}`}><div className="role">{message.role === 'user' ? '你' : 'Agent'}</div><div className="bubble" dangerouslySetInnerHTML={message.role === 'assistant' ? {__html: markdownHtml(message.content || '')} : undefined}>{message.role === 'user' ? message.content : undefined}</div></article>)}
+        {selected && (() => {
+          const visible = messages.filter(item => item.role !== 'tool' && (item.content || item.thinking || (item.tool_calls && item.tool_calls.length)))
+          if (!visible.length) return <div className="empty"><span><MessageSquare size={24}/></span><h2>有什么可以帮你？</h2><p>发送问题，Agent 会自主判断是否调用工具。</p></div>
+          return visible.map(message => {
+            const toolCalls = message.tool_calls
+            const isToolCall = !!(toolCalls && toolCalls.length)
+            const thinking = message.thinking || (isToolCall ? (message.content || '') : '')
+            const answer = isToolCall ? '' : (message.content || '')
+            const toolCount = toolCalls?.length ?? 0
+            return <article key={`${message.seq}-${message.role}`} className={`message ${message.role}`}>
+              <div className="role">{message.role === 'user' ? '你' : 'Agent'}</div>
+              {message.role === 'assistant' && thinking && <details className="thinking"><summary><BrainCircuit size={12}/><span>思考过程</span><em>决策摘要</em></summary><p>{thinking}</p></details>}
+              {isToolCall && <div className="tool-calls"><Wrench size={13}/>调用了 {toolCount} 个工具</div>}
+              {answer && <div className="bubble" dangerouslySetInnerHTML={message.role === 'assistant' ? {__html: markdownHtml(answer)} : undefined}>{message.role === 'user' ? answer : undefined}</div>}
+            </article>
+          })
+        })()}
         {busy && <div className="running"><span/><span/><span/><em>{run?.status === 'cancel_requested' ? '正在停止' : '正在处理'}</em></div>}
         <div ref={endRef}/>
       </section>}
