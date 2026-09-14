@@ -15,12 +15,13 @@
 import asyncio
 import json
 import time
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import httpx
 
 from .context import ContextManager, estimate_tokens
 from .contracts import ExecutionContext, Final, Invalid, RunResult, ToolCall, ToolResult
+from .events import RunEventBus
 from .model import ModelClient, parse_response
 from .storage import ResourceStore, Store
 from .tools import ToolRegistry
@@ -52,12 +53,20 @@ def _model_output_head(raw: dict[str, Any], limit: int = 160) -> dict[str, Any]:
     }
 
 
-# 原生协议下没有 decision_summary 字段，因此约定模型用首行「思考：…」承载决策说明。
-# 措辞要明确禁止"展开推理链"，否则模型容易把长篇思考写进用户可见的回答。
+def _message_of(raw: dict[str, Any]) -> dict[str, Any]:
+    """取响应里的 message：原生协议在 ``choices[0].message``，JSON 模式则是摊平后的结构本身。"""
+    if isinstance(raw.get("choices"), list) and raw["choices"]:
+        return raw["choices"][0].get("message") or {}
+    return raw
+
+
+# 思考过程改由服务商的 reasoning_content 承载（界面单独呈现），因此不再要求模型把「思考：…」
+# 写进正文首行——那会把推理混进用户可见的回答，也让流式输出平白多剥一层。
+# 这里只保留真正必要的约束：回答与工具调用二者择一，不要互相夹带。
 NATIVE_PROTOCOL_HINT = (
-    "请使用标准的工具调用方式工作。每次回复的第一行都必须是决策说明，格式固定为「思考：<一句简短中文判断依据>」，"
-    "第二行起才是给用户的最终回答；需要调用工具时，第一行仍然写这条决策说明，然后再发出工具调用。"
-    "决策说明只写这一步的判断依据：一句话讲清楚即可，不要复述用户问题，不要展开推理链，不要编造没有发生的动作。"
+    "请使用标准的工具调用方式工作。需要调用工具时，只发出工具调用，不要在正文里夹带给用户的回答；"
+    "直接回答时，给出完整、结构清晰的中文回答，不要复述用户问题，不要编造没有发生的动作。"
+    "推理过程与回答一律使用中文。"
 )
 
 
@@ -87,8 +96,11 @@ def _repair_instruction(code: str, mode: str) -> str:
 
 
 class AgentRuntime:
-    def __init__(self, store: Store, registry: ToolRegistry, resources: ResourceStore, model_factory: Callable[[str], tuple[ModelClient, str, int, int]], *, max_model_calls: int = 12, max_repairs: int = 2, max_summary_calls: int = 2, run_timeout: float = 180, safety_margin: int = 1024, soft_context_ratio: float = .70, hard_context_ratio: float = .85, target_context_ratio: float = .55) -> None:
+    def __init__(self, store: Store, registry: ToolRegistry, resources: ResourceStore, model_factory: Callable[[str], tuple[ModelClient, str, int, int]], *, max_model_calls: int = 12, max_repairs: int = 2, max_summary_calls: int = 2, run_timeout: float = 180, safety_margin: int = 1024, soft_context_ratio: float = .70, hard_context_ratio: float = .85, target_context_ratio: float = .55, events: RunEventBus | None = None) -> None:
         self.store, self.registry, self.resources = store, registry, resources
+        # 事件总线：把流式增量实时投给该运行的 SSE 订阅者。默认自建一个，
+        # 便于单独使用运行时（例如测试）时不依赖接口层装配。
+        self.events = events or RunEventBus()
         # model_factory 按模型名返回 (客户端, 协议, 上下文窗口, 输出预留)，便于同一进程服务多个模型。
         self.model_factory = model_factory
         self.max_model_calls, self.max_repairs, self.max_summary_calls, self.run_timeout = max_model_calls, max_repairs, max_summary_calls, run_timeout
@@ -128,8 +140,13 @@ class AgentRuntime:
                 raise
         return run, created
 
-    async def _model_call(self, run_id: str, model: ModelClient, messages: list[dict[str, Any]], tools: list[dict[str, Any]], tool_choice: str, *, max_attempts: int = 3, phase: str = "response", iteration: int = 0) -> dict[str, Any]:
-        """调用模型，内置重试与协作式取消。返回原始响应。"""
+    async def _model_call(self, run_id: str, model: ModelClient, messages: list[dict[str, Any]], tools: list[dict[str, Any]], tool_choice: str, *, max_attempts: int = 3, phase: str = "response", iteration: int = 0, sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None) -> dict[str, Any]:
+        """调用模型，内置重试与协作式取消。返回原始响应。
+
+        传 ``sink`` 时走流式：增量到达当下就交给它（落库 + 广播），而不是等整段生成完再回放。
+        不传则是一次性调用——压缩摘要走的就是这条路，摘要不需要边生成边给用户看。
+        两条路共用同一套重试与取消语义，避免"流式与非流式的错误处理各写一套"。
+        """
         last_error: Exception | None = None
         for attempt in range(max_attempts):
             current = await self.store.get_run(run_id)
@@ -138,17 +155,15 @@ class AgentRuntime:
                 raise RuntimeError("model_call_limit")
             await self.store.increment_model_calls(run_id)
             started = time.perf_counter()
-            await self.store.add_trace(run_id, "model.started", {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "tool_choice": tool_choice})
+            await self.store.add_trace(run_id, "model.started", {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "tool_choice": tool_choice, "stream": sink is not None})
             try:
-                # 手动轮询而不是直接 await：这样在等待模型返回的过程中也能响应"停止"。
-                task = asyncio.create_task(model.complete(messages, tools, tool_choice=tool_choice))
-                while not task.done():
-                    await asyncio.wait({task}, timeout=.1)
-                    if await self.store.is_cancel_requested(run_id):
-                        task.cancel()
-                        await asyncio.gather(task, return_exceptions=True)
-                        raise RuntimeError("cancelled")
-                raw = await task
+                if sink is None:
+                    raw = await self._await_task(run_id, asyncio.create_task(model.complete(messages, tools, tool_choice=tool_choice)))
+                else:
+                    # 每次尝试都从零累计：上一次尝试可能已经流出去一部分，必须先让 sink 撤回它，
+                    # 否则重试成功后内容会叠加成"半句 + 完整句"。
+                    await sink({"type": "reset"})
+                    raw = await self._consume_stream(run_id, model, messages, tools, tool_choice, sink)
                 await self.store.add_trace(run_id, "model.finished", {"attempt": attempt + 1, "iteration": iteration, "phase": phase, "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
                 return raw
             except httpx.TransportError as exc:
@@ -170,6 +185,74 @@ class AgentRuntime:
                 if attempt + 1 < max_attempts:
                     await asyncio.sleep((.5, 1)[attempt])
         raise RuntimeError("model_unavailable") from last_error
+
+    async def _await_task(self, run_id: str, task: "asyncio.Task[Any]") -> Any:
+        """等待任务完成，期间按 100ms 轮询取消标志 —— 协作式取消的落点。"""
+        while not task.done():
+            await asyncio.wait({task}, timeout=.1)
+            if await self.store.is_cancel_requested(run_id):
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise RuntimeError("cancelled")
+        return await task
+
+    async def _consume_stream(self, run_id: str, model: ModelClient, messages: list[dict[str, Any]], tools: list[dict[str, Any]], tool_choice: str, sink: Callable[[dict[str, Any]], Awaitable[None]]) -> dict[str, Any]:
+        """消费流式响应：每个增量立刻交给 sink，返回拼装好的完整响应。
+
+        消费放在独立任务里、经队列与主循环衔接，是为了在"模型长时间不吐字"时仍能响应停止：
+        若直接 `async for` 迭代，协程会一直挂在读取上，取消检查根本没有执行的机会。
+        """
+        streamer = getattr(model, "stream", None)
+        if streamer is None:
+            # 客户端不提供 stream（测试用的假实现，或只实现 complete 的适配器）：
+            # 退化成一次普通调用，再把整段内容当成一次增量补发。语义与流式路径完全一致，只是看不到逐字效果。
+            raw = await self._await_task(run_id, asyncio.create_task(model.complete(messages, tools, tool_choice=tool_choice)))
+            message = _message_of(raw)
+            reasoning = message.get("reasoning_content") or ""
+            if reasoning:
+                await sink({"type": "reasoning", "text": str(reasoning)})
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                await sink({"type": "content", "text": content})
+            return raw
+        pending: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        async def pump() -> None:
+            try:
+                async for chunk in streamer(messages, tools, tool_choice=tool_choice):
+                    await pending.put(chunk)
+            finally:
+                # 哨兵：无论正常结束还是中途抛错，都要让消费循环退出；
+                # pump 内部的异常会在下方 `await task` 处重新抛出，交给调用方按原有策略重试。
+                await pending.put(None)
+
+        task = asyncio.create_task(pump())
+        raw: dict[str, Any] | None = None
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(pending.get(), timeout=.1)
+                except asyncio.TimeoutError:
+                    if await self.store.is_cancel_requested(run_id):
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                        raise RuntimeError("cancelled")
+                    continue
+                if chunk is None:
+                    break
+                if chunk.get("type") == "done":
+                    raw = chunk.get("raw")
+                    continue
+                await sink(chunk)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        await task
+        if not isinstance(raw, dict):
+            # 上游提前断流（既没有 done 也没有抛错）也要当成可重试的传输故障，而不是静默返回半个响应。
+            raise httpx.ReadError("流式响应意外结束，未收到结束标记")
+        return raw
 
     async def _tool_call(self, run_id: str, name: str, args: dict[str, Any], context: ExecutionContext) -> ToolResult:
         """执行工具（同样支持取消）。"""
@@ -309,30 +392,63 @@ class AgentRuntime:
                 tool_choice = "none" if run_now and run_now["model_calls"] >= self.max_model_calls - 1 else "auto"
                 # 协议约定放在消息末尾：紧邻生成位置，模型遵从率明显高于混在开头 system 里。
                 bundle.messages.append({"role": "system", "content": _protocol_hint(mode, tools)})
-                # 第 3 步：调用模型。
-                raw = await self._model_call(run_id, model, bundle.messages, tools, tool_choice, iteration=iteration)
+                # 第 3 步：流式调用模型。增量在到达当下就落库并广播，前端因此是逐字生长，
+                # 而不是像过去那样"等整段生成完，再按固定步长把完整答案回放一遍"。
+                content = thinking = ""
+                assistant_seq: int | None = None
+                last_flush = 0.0
+
+                async def sink(chunk: dict[str, Any]) -> None:
+                    """把一个增量并入本轮的助手消息：广播每一片，落库按节流。"""
+                    nonlocal assistant_seq, content, thinking, last_flush
+                    kind = chunk.get("type")
+                    if kind == "reset":
+                        # 作废本轮已流出的内容（重试前调用）：撤回消息并清空累计。
+                        content = thinking = ""
+                        if assistant_seq is not None:
+                            await self.store.delete_message(session_id, assistant_seq)
+                            self.events.publish(run_id, {"type": "discard", "seq": assistant_seq})
+                            assistant_seq = None
+                        return
+                    if kind == "reasoning":
+                        thinking += chunk["text"]
+                    elif kind == "content":
+                        content += chunk["text"]
+                    else:
+                        return
+                    if assistant_seq is None:
+                        # 消息在第一个增量到达时才创建：纯工具轮（既无思考也无正文）不会留下空壳消息。
+                        assistant_seq = await self.store.add_message(session_id, run_id, "assistant", {})
+                    now = time.perf_counter()
+                    # 增量可能每秒几十条，逐片写库毫无必要：广播照发（内存操作，界面实时），
+                    # 落库节流到 150ms 一次；结束前再补一次权威写入，数据库里一定是完整内容。
+                    if now - last_flush >= .15:
+                        last_flush = now
+                        await self.store.update_message_fields(session_id, assistant_seq, {"content": content, "thinking": thinking})
+                    self.events.publish(run_id, {"type": "delta", "seq": assistant_seq, "content": content, "thinking": thinking})
+
+                raw = await self._model_call(run_id, model, bundle.messages, tools, tool_choice, iteration=iteration, sink=sink)
                 event = parse_response(raw, mode)
                 if isinstance(event, Final):
-                    # 第 4 步之一：终答。先落一条空消息拿到 seq，再按 24 字一片更新，
-                    # 前端 SSE 就能按 seq 定位这条消息并看到逐段生长的效果。
-                    initial_payload: dict[str, Any] = {"content": ""}
-                    if event.decision_summary:
-                        initial_payload["thinking"] = event.decision_summary.strip()
-                    assistant_seq = await self.store.add_message(session_id, run_id, "assistant", initial_payload)
-                    streamed = ""
-                    for index in range(0, len(event.answer), 24):
-                        if await self.store.is_cancel_requested(run_id):
-                            # 已流出的部分保留在库里，整体状态标记为已取消。
-                            raise RuntimeError("cancelled")
-                        streamed += event.answer[index:index + 24]
-                        await self.store.update_message_content(session_id, assistant_seq, streamed)
-                        await self.store.add_trace(run_id, "assistant.delta", {"content": streamed, "complete": index + 24 >= len(event.answer)})
-                        await asyncio.sleep(.02)
+                    # 第 4 步之一：终答。正文已经边收边写过了，这里用解析结果做一次权威覆盖——
+                    # 模型若仍写了首行决策说明，会被这一写剥掉，落库正文与协议解析结果始终一致。
+                    if assistant_seq is None:
+                        # 一个字都没流出来就直接终答（例如推理没有走 reasoning_content）：补一条消息，界面不能停在半空。
+                        assistant_seq = await self.store.add_message(session_id, run_id, "assistant", {})
+                    final_thinking = thinking or event.decision_summary
+                    await self.store.update_message_fields(session_id, assistant_seq, {"content": event.answer, "thinking": final_thinking})
+                    self.events.publish(run_id, {"type": "delta", "seq": assistant_seq, "content": event.answer, "thinking": final_thinking or ""})
+                    await self.store.add_trace(run_id, "assistant.delta", {"complete": True, "chars": len(event.answer), "iteration": iteration})
                     await self.store.finish_run(run_id, "completed", event.answer)
                     await self.store.add_trace(run_id, "run.finished", {"status": "completed"})
                     return RunResult(run_id, session_id, "completed", event.answer, operations=operations)
                 if isinstance(event, Invalid):
-                    # 第 4 步之二：协议非法。记下模型原始输出（含 finish_reason/用量）便于排查。
+                    # 第 4 步之二：协议非法。这一轮整轮作废——已经流出去的部分必须撤回，
+                    # 否则界面上会留下一条只说了一半的幽灵回答。
+                    if assistant_seq is not None:
+                        await self.store.delete_message(session_id, assistant_seq)
+                        self.events.publish(run_id, {"type": "discard", "seq": assistant_seq})
+                        assistant_seq = None
                     repairs += 1
                     await self.store.add_trace(run_id, "model.invalid", {"code": event.code, "reason": event.message[:200], "output": _model_output_head(raw), "iteration": iteration})
                     if repairs > self.max_repairs:
@@ -366,7 +482,17 @@ class AgentRuntime:
                     # 它只用于协议回传，不进入界面展示，也不参与决策。
                     if event.reasoning_content:
                         tool_payload["reasoning_content"] = event.reasoning_content[:8000]
-                    await self.store.add_message(session_id, run_id, "assistant", tool_payload)
+                    # 思考过程：把流式收下来的推理一并展示，比只留一句决策说明更接近模型实际在想什么。
+                    if thinking:
+                        tool_payload["thinking"] = thinking[:8000]
+                    if assistant_seq is None:
+                        # 模型没有产出任何增量（直接给出工具调用）：工具调用就是这一轮唯一的产物。
+                        await self.store.add_message(session_id, run_id, "assistant", tool_payload)
+                    else:
+                        # 流式期间已经落了本轮的助手消息（含思考过程）：把工具调用补到同一条上，
+                        # 不要另起一条，否则界面上会出现"只有思考、没有下文"的空壳消息。
+                        await self.store.update_message_fields(session_id, assistant_seq, tool_payload)
+                        self.events.publish(run_id, {"type": "delta", "seq": assistant_seq, "content": tool_payload.get("content") or "", "thinking": tool_payload.get("thinking") or ""})
                     await self.store.add_trace(run_id, "tool.started", {"call_id": event.call_id, "name": event.name, "iteration": iteration})
                     # 工具结果的预算按工具类型分配：检索类给得少（1%），其余给 10%，并受剩余上下文约束。
                     ratio = .02 if event.name == "resource_search" else .10
