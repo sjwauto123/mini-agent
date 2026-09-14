@@ -27,6 +27,12 @@ from .schema import (
     utc_now,
 )
 
+# 允许落库的消息角色。模型的角色由调用点决定（用户输入只会以 user 落库），这里再加一道白名单：
+# model.py 是把 messages 原样透传给上游的、没有任何二次过滤，所以"会不会落进一条 role=system
+# 的消息"只能在这一层挡住。当前所有写入都出自 runtime，取值本身不会越界；这道校验是为了让将来
+# 新增"导入对话""用户可写消息"之类的接口时，提权在数据层就被拒绝，而不是靠调用纪律兜着。
+MESSAGE_ROLES = frozenset({"user", "assistant", "tool"})
+
 
 class Store:
     def __init__(self, db_path: Path) -> None:
@@ -203,6 +209,10 @@ class Store:
         seq 在会话内单调递增：既用于排序，也是前端的消息定位键（SSE 推送靠它对上号）。
         传入 ``connection`` 时可以并入调用方的事务（工具写入 + 消息落库要么同时成功、要么同时回滚）。
         """
+        # 角色白名单：越界取值直接拒绝，避免"用户可指定角色"的接口一旦出现就变成提权通道。
+        if role not in MESSAGE_ROLES:
+            raise ValueError(f"invalid message role: {role}")
+
         async def write(conn: Any) -> int:
             # max(seq) + 1 在同一个写事务里计算，配合 (session_id, seq) 唯一约束避免并发下撞号。
             seq = int(await conn.scalar(select(func.coalesce(
