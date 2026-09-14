@@ -200,7 +200,11 @@ header p { margin: 3px 0 0; color: var(--subtle); font-size: 11px; overflow: hid
 .thinking summary::before { content: "▸"; display: inline-block; color: #aaa; font-size: 10px; transition: transform .15s ease; }
 .thinking[open] summary::before { transform: rotate(90deg); }
 .thinking summary em { padding: 1px 6px; border-radius: 8px; background: #ececee; color: #8a8a8d; font-size: 10px; font-weight: 600; font-style: normal; }
-.thinking p { margin: 7px 0 0; color: #5d5d5f; white-space: pre-wrap; word-break: break-word; }
+/* 推理是持续追加的长文本：限高并独立滚动，避免它把最终回答挤出屏幕。 */
+.thinking p { margin: 7px 0 0; max-height: 260px; overflow-y: auto; color: #5d5d5f; white-space: pre-wrap; word-break: break-word; }
+/* 思考中：左侧色条与底色偏蓝，与“已完成”的灰色区分开，让用户一眼看出还在进行。 */
+.thinking.streaming { border-left-color: #4672aa; background: #f5f8fd; }
+.thinking.streaming summary { color: #35507d; }
 /* —— 工具调用标记 —— */
 .tool-calls { display: inline-flex; align-items: center; gap: 6px; margin: 4px 0 8px; padding: 5px 10px; border-radius: 6px; background: #eef4ff; color: #3565a9; font-size: 11px; font-weight: 600; }
 .tool-calls svg { color: #4672aa; }

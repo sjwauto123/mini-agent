@@ -212,6 +212,23 @@ const TraceGroups = ({ trace, runs, expandedRunId, onToggle }: TraceGroupsProps)
   })}</div>
 }
 
+// 思考过程面板：对齐主流产品的默认行为 —— 思考中自动展开并走计时，回答完成后自动折叠成一行。
+// 推理是边生成边追加的，所以这里要自动贴底，用户不必手动追着滚。
+const ThinkingPanel = ({ thinking, busy, seconds }: { thinking: string; busy: boolean; seconds: number | null }) => {
+  const [open, setOpen] = useState(busy)
+  const bodyRef = useRef<HTMLParagraphElement>(null)
+  // 展开状态跟随"是否在思考"：开始思考时展开、结束后折叠；用户手动折叠后不会被强行再拉开。
+  useEffect(() => { setOpen(busy) }, [busy])
+  useEffect(() => {
+    if (open && bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight
+  }, [thinking, open])
+  const meta = seconds === null ? '' : busy ? `已用 ${seconds} 秒` : `用时 ${seconds} 秒`
+  return <details className={`thinking ${busy ? 'streaming' : ''}`} open={open} onToggle={event => setOpen(event.currentTarget.open)}>
+    <summary><BrainCircuit size={12}/><span>{busy ? '思考中' : '思考过程'}</span>{meta && <em>{meta}</em>}</summary>
+    <p ref={bodyRef}>{thinking}</p>
+  </details>
+}
+
 // —— 4. 主应用组件 ——
 // 状态流：sessions（左侧列表）→ selected（当前会话）→ messages/runs/trace（该会话的数据）；
 // busy 由 run.status 推导，用于禁用发送、切换“正在处理 / 正在停止”提示。
@@ -232,21 +249,26 @@ export default function App() {
     try { return localStorage.getItem('mini-agent:sessions-collapsed') === '1' } catch { return false }
   })
   const [error, setError] = useState('')
+  const [clock, setClock] = useState(() => Date.now())
   const endRef = useRef<HTMLDivElement>(null)
   const selectedRef = useRef(selected)
   const eventSourceRef = useRef<EventSource | null>(null)
   // 历史加载的代次：发送消息时递增，作废仍在飞行中的加载，避免它用旧快照覆盖本轮乐观更新的消息。
   const messagesLoadRef = useRef(0)
+  // 本轮运行的起点：思考面板的「已用 X 秒」由它和 clock 的差值算出。
+  const runStartedAt = useRef<number | null>(null)
 
   // 派生状态：当前会话对象，以及“是否正在处理中”。
   const current = sessions.find(item => item.id === selected)
   const busy = Boolean(run && !TERMINAL_STATUSES.has(run.status))
+  // 思考计时：运行期间每 200ms 走一次表；结束后不再更新，最后一条消息的「用时」便冻结在结束那一刻。
+  const elapsedSeconds = runStartedAt.current === null ? null : Math.max(0, Math.round((clock - runStartedAt.current) / 1000))
 
   // —— 4.2 数据加载与会话操作 ——
   // 切换会话：关闭旧 SSE 订阅、清空所有与会话绑定的状态，并把选中项同步到地址栏（?session=），
   // 以便刷新页面后仍停留在同一个会话。
   const selectSession = (id: string) => {
-    eventSourceRef.current?.close(); eventSourceRef.current = null; selectedRef.current = id
+    eventSourceRef.current?.close(); eventSourceRef.current = null; selectedRef.current = id; runStartedAt.current = null
     setSelected(id); setSidebar(false); setMessages([]); setRun(null); setRuns([]); setTrace([]); setExpandedTraceRun(null); setView('chat'); setError('')
     const url = new URL(location.href)
     if (id) url.searchParams.set('session', id)
@@ -323,13 +345,21 @@ export default function App() {
         return current.map((item, itemIndex) => itemIndex === index ? { ...item, content, thinking: thinking || item.thinking } : item)
       })
     })
+    source.addEventListener('discard', event => {
+      if (selectedRef.current !== sessionId) return
+      const payload = JSON.parse((event as MessageEvent).data) as { seq?: number }
+      // 后端作废了这一轮的流式输出（协议非法，或重试要从头再流一遍）：把已经流出去的那半句撤掉，
+      // 否则界面上会留下一条说了一半的幽灵回答。
+      if (typeof payload.seq === 'number') setMessages(current => current.filter(item => item.seq !== payload.seq))
+    })
   }
   // 刷新页面后恢复运行：若最新运行尚未结束则重新接上 SSE，并回填错误提示与轨迹。
   const restoreRun = async (id: string) => {
     const latest = await api<Run | null>(`/api/sessions/${id}/runs/latest`)
     if (selectedRef.current !== id) return
     setRun(latest)
-    if (latest && !TERMINAL_STATUSES.has(latest.status)) watchRun(latest.id, id)
+    // 刷新页面后接上一个仍在进行的运行：计时从此刻起算（此前的时间拿不回来，只能按可见部分计时）。
+    if (latest && !TERMINAL_STATUSES.has(latest.status)) { runStartedAt.current = Date.now(); watchRun(latest.id, id) }
     if (latest) await loadTrace(latest.id, id)
     if (latest?.error?.code && latest.status !== 'cancelled') setError(errorMessage(latest.error.code))
   }
@@ -341,6 +371,12 @@ export default function App() {
   useEffect(() => { if (selected) Promise.all([loadMessages(selected), loadRuns(selected), restoreRun(selected)]).catch(e => setError(e.message)) }, [selected])
   // 问答视图下，消息或运行变化时自动滚到底部。
   useEffect(() => { if (view === 'chat') endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, run, view])
+  // 思考计时器：只在运行期间走表，结束后自动停掉，省掉无谓的重渲染。
+  useEffect(() => {
+    if (!busy) return
+    const timer = window.setInterval(() => setClock(Date.now()), 200)
+    return () => window.clearInterval(timer)
+  }, [busy])
   // 组件卸载时关闭 SSE，避免连接泄漏。
   useEffect(() => () => eventSourceRef.current?.close(), [])
   // 持久化“会话列表折叠”偏好。
@@ -390,7 +426,7 @@ export default function App() {
       if (selectedRef.current !== sessionId) return
       // 作废可能仍在飞行中的历史加载，否则它返回的空快照会把刚发出的这条消息抹掉。
       messagesLoadRef.current += 1
-      setDraft(''); setMessages(old => [...old, { role: 'user', content: message, seq: Date.now() }]); setRun({ id: result.run_id, status: 'running' }); watchRun(result.run_id, sessionId)
+      setDraft(''); runStartedAt.current = Date.now(); setMessages(old => [...old, { role: 'user', content: message, seq: Date.now() }]); setRun({ id: result.run_id, status: 'running' }); watchRun(result.run_id, sessionId)
     } catch (e) { setError((e as Error).message) }
   }
   // 请求停止当前运行（后端异步取消，最终状态仍由 SSE 的终态通知前端）。
@@ -435,6 +471,9 @@ export default function App() {
         {selected && (() => {
           const visible = messages.filter(item => item.role !== 'tool' && (item.content || item.thinking || (item.tool_calls && item.tool_calls.length)))
           if (!visible.length) return <div className="empty"><span><MessageSquare size={24}/></span><h2>有什么可以帮你？</h2><p>发送问题，Agent 会自主判断是否调用工具。</p></div>
+          // 正在流式生长的那条才可能处于"思考中"；也只有最新一条助手消息才显示计时（历史消息拿不到当时的耗时）。
+          const newestAssistant = [...messages].reverse().find(item => item.role === 'assistant')
+          const streamingSeq = busy ? newestAssistant?.seq : undefined
           return visible.map(message => {
             const toolCalls = message.tool_calls
             const isToolCall = !!(toolCalls && toolCalls.length)
@@ -443,7 +482,7 @@ export default function App() {
             const toolCount = toolCalls?.length ?? 0
             return <article key={`${message.seq}-${message.role}`} className={`message ${message.role}`}>
               <div className="role">{message.role === 'user' ? '你' : 'Agent'}</div>
-              {message.role === 'assistant' && thinking && <details className="thinking"><summary><BrainCircuit size={12}/><span>思考过程</span><em>决策摘要</em></summary><p>{thinking}</p></details>}
+              {message.role === 'assistant' && thinking && <ThinkingPanel thinking={thinking} busy={message.seq === streamingSeq} seconds={message.seq === newestAssistant?.seq ? elapsedSeconds : null}/>}
               {isToolCall && <div className="tool-calls"><Wrench size={13}/>调用了 {toolCount} 个工具</div>}
               {answer && <div className="bubble" dangerouslySetInnerHTML={message.role === 'assistant' ? {__html: markdownHtml(answer)} : undefined}>{message.role === 'user' ? answer : undefined}</div>}
             </article>
