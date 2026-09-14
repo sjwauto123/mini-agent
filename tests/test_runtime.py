@@ -6,7 +6,8 @@ import httpx
 
 from mini_agent.contracts import ToolResult
 from mini_agent.errors import ModelServiceError
-from mini_agent.runtime import AgentRuntime
+from mini_agent.events import RunEventBus
+from mini_agent.runtime import LANGUAGE_HINT, AgentRuntime
 from mini_agent.tools import ToolSpec
 
 from .fakes import ScriptedModel, final, tool
@@ -174,6 +175,51 @@ async def test_protocol_level_transport_error_is_retried_not_unclassified(servic
     trace = await store.list_trace(run["id"])
     failed = [item for item in trace if item["event_type"] == "model.failed"]
     assert failed and failed[-1]["payload"]["code"] == "RemoteProtocolError"
+
+
+async def test_retry_is_announced_and_language_hint_is_the_last_message(services):
+    """两件事一起验：
+
+    1. 上游挂起时（实测有 20.9 秒才抛 RemoteProtocolError 的情况）必须推一条"正在重试"的提示——
+       那段沉默里数据库毫无变化，快照推不出内容，没有这条提示界面看着就是卡死；
+    2. 语言约束必须是模型看到的**最后一条**消息：只写在开头 SYSTEM_PROMPT 或协议提示句尾时，
+       实测第 1 轮仍会整轮返回英文推理（1000+ 字，会原样显示在思考面板里）。
+    """
+
+    class FlakyModel:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.seen: list[dict] = []
+
+        async def complete(self, messages, tools, *, tool_choice="auto"):
+            self.calls += 1
+            self.seen = messages
+            if self.calls == 1:
+                raise httpx.RemoteProtocolError("server disconnected without response")
+            return final("好了")
+
+    store, resources, registry = services
+    bus = RunEventBus()
+    model = FlakyModel()
+    runtime = AgentRuntime(store, registry, resources, lambda _: (model, "native", 16384, 2048), events=bus)
+    session_id = await store.create_session()
+    run, _ = await runtime.submit(session_id, "你好")
+    queue = bus.subscribe(run["id"])
+    result = await runtime.execute(run["id"])
+    assert result.status == "completed" and model.calls == 2
+
+    notices = []
+    while not queue.empty():
+        event = queue.get_nowait()
+        if event.get("type") == "notice":
+            notices.append(event)
+    assert len(notices) == 1, notices
+    assert notices[0]["code"] == "model_retry"
+    assert notices[0]["attempt"] == 2 and notices[0]["delay_ms"] == 500
+
+    # 模型输入的最后一条必须是语言约束：位置比措辞更关键。
+    assert model.seen[-1]["role"] == "system"
+    assert model.seen[-1]["content"] == LANGUAGE_HINT
 
 
 async def test_model_call_limit_stops_loop(services):

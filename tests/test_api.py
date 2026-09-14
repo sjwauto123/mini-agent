@@ -4,6 +4,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -110,6 +111,39 @@ def test_sse_message_events_are_anchored_and_never_empty(tmp_path: Path):
         history = client.get(f"/api/sessions/{session_id}/messages").json()
         previous_seq = next(item["seq"] for item in history if item["role"] == "assistant")
         assert all(payload["seq"] > previous_seq for payload in payloads), "推送目标必须是本轮新回答"
+
+
+def test_retry_notice_is_streamed_to_the_client(tmp_path: Path):
+    """上游挂起时，接口层必须把"正在重试"推给前端。
+
+    这是那段沉默里唯一的信息来源：运行状态没有变化，快照推不出内容，界面否则只能一直转圈。
+    第一次尝试刻意先挂 600ms 再断开，保证 SSE 已订阅、提示不会丢在订阅之前。
+    """
+
+    class FlakyModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tools, *, tool_choice="auto"):
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(.6)
+                raise httpx.RemoteProtocolError("server disconnected without response")
+            return final("好了")
+
+    config = make_config(tmp_path)
+    migrate_database(tmp_path / "state.db")
+    with TestClient(create_app(config, {"test": FlakyModel()})) as client:
+        session_id = client.post("/api/sessions", json={"model_name": "test"}).json()["id"]
+        run_id = client.post(f"/api/sessions/{session_id}/runs", json={"message": "你好"}).json()["run_id"]
+        events = client.get(f"/api/runs/{run_id}/events")
+
+    assert events.status_code == 200
+    notices = [line for line in events.text.splitlines() if line.startswith("event: notice")]
+    assert notices, f"应当推送过 notice 事件：{events.text[:400]}"
+    payload = next(json.loads(line[6:]) for line in events.text.splitlines()
+                   if line.startswith("data: ") and '"model_retry"' in line)
+    assert payload["code"] == "model_retry" and payload["attempt"] == 2 and payload["delay_ms"] == 500
 
 
 def test_different_sessions_run_independently(tmp_path: Path):
