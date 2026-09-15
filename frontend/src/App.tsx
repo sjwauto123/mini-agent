@@ -94,6 +94,31 @@ const errorMessage = (code: string) => ERROR_MESSAGES[code] || '请求失败，�
 // 同 errorMessage，但用于执行日志“原因：xxx”的场景，容错接受任意类型的 code。
 const detailMessage = (code: unknown) => ERROR_MESSAGES[String(code || '')] || '执行过程中出现问题，请稍后重试'
 
+/**
+ * 取出事件里的原始错误详情（后端截 300 字）拼成一句附注。
+ *
+ * 错误码是归一化后的结论，详情才是“上游到底说了什么”——重试与失败事件都带着它，
+ * 只显示错误码会让排障不得不展开原始 JSON。这里做单行限长，避免把执行日志撑成一堵墙；
+ * 需要完整原文时仍可在节点的“查看事件数据”里展开。
+ */
+const detailSnippet = (value: unknown, limit = 120) => {
+  const text = typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : ''
+  return text ? ` 详情：${text.length > limit ? `${text.slice(0, limit)}…` : text}` : ''
+}
+
+/**
+ * 拼“原因：xxx”片段：只有错误码能映射成具体中文时才输出。
+ *
+ * 映射不到时（httpx 的 RemoteProtocolError、模型层的 empty_response 等）通用句回答不了
+ * “为什么”，而它后面紧跟着详情原文——两句话并存只是白占一行。但若这一次压根没有详情可看，
+ * 就退回通用句，至少让用户知道出错了。
+ */
+const reasonClause = (code: unknown, detail: unknown) => {
+  const known = ERROR_MESSAGES[String(code || '')]
+  if (known) return ` 原因：${known}`
+  return code && !detail ? ` 原因：${detailMessage(code)}` : ''
+}
+
 // —— 2. 渲染工具函数 ——
 // 用最小正则实现 Markdown 子集渲染，不引入第三方库；
 // 安全前提是所有文本先经 escapeHtml 转义，之后拼入标签不会造成 XSS。
@@ -193,15 +218,28 @@ const tracePresentation = (item: TraceItem) => {
     }
     return parts.filter(Boolean).join(' · ')
   })()
+  // 协议修复事件的响应头：finish_reason 与 content_len 合看才能区分“被上游截断”与“模型真的只回了空白”。
+  // 后端专门记了这几个字段，展示层不该丢掉——否则看到 code 也不知道这次修复值不值得追究。
+  const invalidHead = (() => {
+    const output = (payload.output ?? {}) as { finish_reason?: unknown; content_len?: unknown; reasoning_len?: unknown }
+    return [
+      output.finish_reason ? `finish_reason=${output.finish_reason}` : '',
+      typeof output.content_len === 'number' ? `正文 ${output.content_len} 字` : '',
+      typeof output.reasoning_len === 'number' && output.reasoning_len > 0 ? `推理 ${output.reasoning_len} 字` : '',
+    ].filter(Boolean).join(' · ')
+  })()
   switch (item.event_type) {
     case 'run.started': return { icon: CircleDashed, tone: 'active', title: '开始运行', description: '已接收用户消息，Agent 开始处理。', meta: '' }
-    case 'model.started': return { icon: BrainCircuit, tone: 'active', title: payload.phase === 'summary' ? '压缩上下文' : '请求模型', description: `${iteration || '当前轮次'}，模型正在判断直接回答还是调用工具。`, meta: `第 ${payload.attempt || 1} 次尝试` }
+    case 'model.started': return { icon: BrainCircuit, tone: 'active', title: payload.phase === 'summary' ? '压缩上下文' : '请求模型', description: `${iteration || '当前轮次'}，模型正在判断直接回答还是调用工具。${payload.tool_choice === 'none' ? '本轮已禁用工具（只剩最后一次调用机会），模型必须直接给出回答。' : ''}`, meta: `第 ${payload.attempt || 1} 次尝试` }
     case 'model.finished': return { icon: CheckCircle2, tone: 'success', title: payload.phase === 'summary' ? '上下文压缩完成' : '模型响应完成', description: '模型已返回可处理的响应。', meta: callMeta }
-    case 'model.retry': return { icon: AlertCircle, tone: 'warning', title: '模型请求重试', description: `请求未成功，正在自动重试。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: duration }
-    case 'model.failed': return { icon: AlertCircle, tone: 'danger', title: '模型请求失败', description: `模型服务请求失败。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: duration }
-    case 'model.invalid': return { icon: AlertCircle, tone: 'warning', title: '模型响应格式修复', description: `响应格式不符合协议，Agent 将要求模型重新返回。${payload.code ? ` 原因：${detailMessage(payload.code)}` : ''}`, meta: iteration }
+    case 'model.retry': return { icon: AlertCircle, tone: 'warning', title: '模型请求重试', description: `请求未成功，正在自动重试。${reasonClause(payload.code, payload.detail)}${detailSnippet(payload.detail)}`, meta: [`第 ${payload.attempt || 1} 次尝试`, duration].filter(Boolean).join(' · ') }
+    case 'model.failed': return { icon: AlertCircle, tone: 'danger', title: '模型请求失败', description: `模型服务请求失败。${reasonClause(payload.code, payload.detail)}${detailSnippet(payload.detail)}`, meta: duration }
+    case 'model.invalid': return { icon: AlertCircle, tone: 'warning', title: '模型响应格式修复', description: `响应格式不符合协议，Agent 将要求模型重新返回。${reasonClause(payload.code, payload.reason)}${detailSnippet(payload.reason)}`, meta: [iteration, invalidHead].filter(Boolean).join(' · ') }
     case 'model.repair': return { icon: RefreshCw, tone: 'warning', title: '重发请求以修复格式', description: payload.minimal_context ? '已改用最小上下文重发：同一上下文会复现相同错误。' : '保持当前上下文原样重发一次。', meta: `第 ${payload.repairs || 1} 次修复` }
-    case 'assistant.delta': return { icon: Send, tone: 'active', title: payload.complete ? '回答输出完成' : '输出回答片段', description: 'Agent 正在把最终回答分片推送给前端。', meta: `${String(payload.content ?? '').length} 字` }
+    // 字数优先取 payload.chars（最终回答落库后写入的权威长度）；早期版本把正文整段写进
+    // payload.content（流式期间分片落多条、complete 可能为 false），这里保留兼容，
+    // 否则历史会话的这条事件会完全没有字数可看。
+    case 'assistant.delta': return { icon: Send, tone: 'active', title: payload.complete ? '回答输出完成' : '输出回答片段', description: 'Agent 正在把最终回答分片推送给前端。', meta: typeof payload.chars === 'number' ? `共 ${payload.chars} 字` : typeof payload.content === 'string' ? `${payload.content.length} 字` : '' }
     case 'tool.started': return { icon: Wrench, tone: 'active', title: `调用工具：${TOOL_NAMES[String(payload.name)] || payload.name}`, description: '模型选择了工具，正在执行并等待结果。', meta: iteration }
     case 'tool.finished': return { icon: payload.ok ? CheckCircle2 : AlertCircle, tone: payload.ok ? 'success' : 'danger', title: `工具${payload.ok ? '执行完成' : '执行失败'}：${TOOL_NAMES[String(payload.name)] || payload.name}`, description: payload.ok ? '工具结果已写入上下文，Agent 将继续判断下一步。' : `工具返回错误：${detailMessage(payload.error_code)}`, meta: duration }
     case 'tool.reused': return { icon: Wrench, tone: 'success', title: `复用工具结果：${TOOL_NAMES[String(payload.name)] || payload.name}`, description: '检测到相同调用，直接使用已保存的结果。', meta: iteration }
@@ -356,6 +394,9 @@ export default function App() {
   const [clock, setClock] = useState(() => Date.now())
   const endRef = useRef<HTMLDivElement>(null)
   const selectedRef = useRef(selected)
+  // 视图的实时值：SSE 回调是“发消息那一刻”创建的闭包，直接读 view 会一直停在旧值
+  // （发消息只能在问答视图，于是运行期间切到执行日志也会被当成还在问答视图，轨迹不再刷新）。
+  const viewRef = useRef(view)
   const eventSourceRef = useRef<EventSource | null>(null)
   // 历史加载的代次：发送消息时递增，作废仍在飞行中的加载，避免它用旧快照覆盖本轮乐观更新的消息。
   const messagesLoadRef = useRef(0)
@@ -424,9 +465,17 @@ export default function App() {
       if (selectedRef.current !== sessionId) { source.close(); return }
       const snapshot = JSON.parse((event as MessageEvent).data) as Run
       setRun(snapshot)
+      // 把最新运行行并回列表：执行日志是按 runs 逐轮渲染的，这一轮不在列表里就画不出任何步骤
+      // （运行期间切过去会看到一张空白页，直到终态整表刷新才出现）。快照与 /runs 列表同源，
+      // 都出自后端的 public_run，字段形状一致，因此可以直接按 id 覆盖。
+      setRuns(current => {
+        const index = current.findIndex(item => item.id === snapshot.id)
+        if (index < 0) return [...current, snapshot]
+        return current.map(item => (item.id === snapshot.id ? snapshot : item))
+      })
       // 运行已经结束（无论成败）就不该再挂着"正在重试"了。
       if (TERMINAL_STATUSES.has(snapshot.status)) setNotice('')
-      if (view === 'trace') loadTrace(runId, sessionId).catch(e => setError(e.message))
+      if (viewRef.current === 'trace') loadTrace(runId, sessionId).catch(e => setError(e.message))
       if (TERMINAL_STATUSES.has(snapshot.status)) {
         source.close()
         if (eventSourceRef.current === source) eventSourceRef.current = null
@@ -494,6 +543,12 @@ export default function App() {
   useEffect(() => { if (selected) Promise.all([loadMessages(selected), loadRuns(selected), restoreRun(selected)]).catch(e => setError(e.message)) }, [selected])
   // 问答视图下，消息或运行变化时自动滚到底部。
   useEffect(() => { if (view === 'chat') endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, run, view])
+  // 视图切换：同步视图的实时值（供 SSE 回调读取），并在进入执行日志视图时拉一次最新轨迹。
+  // 拉取只放在这里：按钮只负责切视图，避免“进入视图”这件事有两个入口各拉一次。
+  useEffect(() => {
+    viewRef.current = view
+    if (view === 'trace' && selected) loadTrace('', selected).catch(e => setError(e.message))
+  }, [view, selected])
   // 思考计时器：只在运行期间走表，结束后自动停掉，省掉无谓的重渲染。
   useEffect(() => {
     if (!busy) return
@@ -563,7 +618,7 @@ export default function App() {
       <button className="new-session" onClick={createSession}><Plus size={17}/>新建会话</button>
       <nav className="module-nav" aria-label="功能模块">
         <button className={`module-item ${view === 'chat' ? 'active' : ''}`} onClick={() => { setView('chat'); setSidebar(false) }}><MessageSquare size={16}/><span>问答</span></button>
-        <button className={`module-item ${view === 'trace' ? 'active' : ''}`} onClick={() => { setView('trace'); setSidebar(false); if (selected) loadTrace('', selected).catch(e => setError(e.message)) }} disabled={!selected}><ListTree size={16}/><span>执行日志</span>{runs.length > 0 && <b className="module-count">{runs.length}</b>}</button>
+        <button className={`module-item ${view === 'trace' ? 'active' : ''}`} onClick={() => { setView('trace'); setSidebar(false) }} disabled={!selected}><ListTree size={16}/><span>执行日志</span>{runs.length > 0 && <b className="module-count">{runs.length}</b>}</button>
       </nav>
       <div className={`sidebar-label sessions-label ${sessionsCollapsed ? 'collapsed' : ''}`}>
         <button className="session-toggle" onClick={() => setSessionsCollapsed(c => !c)} aria-expanded={!sessionsCollapsed} aria-controls="session-list" title={sessionsCollapsed ? '展开会话列表' : '收起会话列表'}>
