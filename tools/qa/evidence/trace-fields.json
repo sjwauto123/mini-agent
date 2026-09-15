@@ -1,0 +1,107 @@
+{
+  "suite": "trace-fields",
+  "description": "不调模型 · 历史数据渲染检查（自发现 fixture，缺数据报 SKIP）",
+  "script": "tools/qa/trace_fields_browser.py",
+  "script_sha256_16": "7185ab78395e4178",
+  "started_at": "2026-09-15T11:01:46+00:00",
+  "python": "C:\\Users\\Lenovo\\Documents\\ChatGPT\\mini-agent\\.venv\\Scripts\\python.exe",
+  "service": {
+    "base": "http://127.0.0.1:8000",
+    "healthy": true,
+    "models": [
+      "deepseek-flash"
+    ],
+    "health": {
+      "status": "ok"
+    }
+  },
+  "finished_at": "2026-09-15T11:01:54+00:00",
+  "duration_s": 7.6,
+  "exit_code": 0,
+  "totals": {
+    "total": 15,
+    "passed": 15,
+    "failed": 0,
+    "advisory": 0,
+    "skipped": 0
+  },
+  "checks": [
+    {
+      "status": "PASS",
+      "name": "所有会话的步骤都命中中文文案（无兜底分支）",
+      "detail": "兜底条数=[0, 0, 0, 0]"
+    },
+    {
+      "status": "PASS",
+      "name": "成功运行的会话不出现错误条",
+      "detail": "异常会话=[]"
+    },
+    {
+      "status": "PASS",
+      "name": "失败的运行如实显示错误条",
+      "detail": "失败会话=1 个，未显示错误条=[]"
+    },
+    {
+      "status": "PASS",
+      "name": "链路树存在两级缩进",
+      "detail": "出现层级=['depth-0', 'depth-1']"
+    },
+    {
+      "status": "PASS",
+      "name": "不再出现 '0 字'",
+      "detail": "零值备注=[]"
+    },
+    {
+      "status": "PASS",
+      "name": "新形态字数按 chars 正确显示",
+      "detail": "期望『共 356 字』"
+    },
+    {
+      "status": "PASS",
+      "name": "旧形态字数仍可读（回退读 content 长度）",
+      "detail": "样例=['24 字', '48 字', '72 字']"
+    },
+    {
+      "status": "PASS",
+      "name": "重试事件显示第几次尝试",
+      "detail": "重试备注=['第 1 次尝试 · 16133 毫秒']"
+    },
+    {
+      "status": "PASS",
+      "name": "重试事件显示原始详情（detail）",
+      "detail": "重试描述样例=['请求未成功，正在自动重试。 详情：Server disconnected without sending a response.']"
+    },
+    {
+      "status": "PASS",
+      "name": "协议非法事件显示 finish_reason",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "name": "协议非法事件显示正文字数",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "name": "协议非法事件显示推理长度",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "name": "已映射的错误码仍显示具体原因",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "name": "有详情时不再输出无信息量的通用原因",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "name": "未映射码给出原始 reason 原文",
+      "detail": ""
+    }
+  ],
+  "result": "ALL PASS",
+  "model_used": "deepseek-flash"
+}
