@@ -98,17 +98,21 @@ React 前端 ──HTTP / SSE──▶ FastAPI 接口层（routers/）
 - Python 3.11+
 - Node.js 20+
 
-PowerShell 安装：
+安装（下面代码块用 `cd` 而不是 `Set-Location`，这样在 PowerShell、cmd 和 Git Bash 里都能直接粘贴执行）：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.lock
-Set-Location frontend
+cd frontend
 npm install
-Set-Location ..
+cd ..
 ```
 
-若本机安全策略拦住了 `npm` / `npx`（某些 Windows 环境里它们是脚本包装器，会经 `wsl.exe` 路由而被拦下），改用同目录的 `npm.cmd` / `npx.cmd`，例如 `npm.cmd run build`。
+三点环境提示：
+
+- **`npm` / `npx` 不可用时的两种成因**：① 它们是脚本包装器、经 `wsl.exe` 路由而被安全策略拦下（Git Bash 里常见）；② PowerShell 执行策略为 `Restricted` 时 `npm.ps1` 被禁止执行。两种情况都改用同目录的 `npm.cmd` / `npx.cmd`，例如 `npm.cmd run build`。
+- **`npm install` 可能改写 `frontend/package-lock.json`**：不同 npm 版本对可选依赖的 `libc` 字段处理不同（实测 npm 10.9.7 会删掉若干 `libc` 条目）。这是版本差异而不是项目变更，**不要把这份 diff 提交**。
+- `requirements.lock` 是权威版本，`pip install -r` 会按它增删依赖（实测会把高于锁定的 `python-dotenv` 降回锁定的版本）。
 
 浏览器测试复用系统已安装的 Chrome 或 Edge，两者都找不到时会自动跳过、不会判定失败。确需 Playwright 自带 Chromium 时再执行：
 
@@ -143,18 +147,18 @@ Copy-Item .env.example .env
 后端监听 [http://127.0.0.1:8000](http://127.0.0.1:8000)。开发前端另开终端：
 
 ```powershell
-Set-Location frontend
+cd frontend
 npm run dev
 ```
 
-后端若运行在 8001 等其他端口，先设置前端开发代理：
+后端若运行在 8001 等其他端口，先设置前端开发代理（下面这条是 PowerShell 写法，Git Bash 用 `VITE_API_TARGET=http://127.0.0.1:8001 npm run dev`）：
 
 ```powershell
 $env:VITE_API_TARGET = "http://127.0.0.1:8001"
 npm run dev
 ```
 
-打开 [http://localhost:5173](http://localhost:5173)（Vite 默认只绑定 `localhost`，用 `127.0.0.1` 可能连不上）。生产式本地运行可先执行 `npm run build`，FastAPI 会从 `frontend/dist` 提供页面。
+打开 [http://localhost:5173](http://localhost:5173)。**必须用 `localhost`**：Vite 只绑定 IPv6 回环，实测 `127.0.0.1:5173` 会直接连接被拒（Windows 错误 10061），`localhost` 与 `[::1]` 都正常。生产式本地运行可先执行 `npm run build`，FastAPI 会从 `frontend/dist` 提供页面。
 
 两个浏览器窗口可以分别创建会话；当前会话 ID 保存在各自 URL 查询参数中，历史、摘要、待办和外置资源不会跨会话共享。
 
@@ -162,11 +166,13 @@ npm run dev
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
-Set-Location frontend
+cd frontend
 npm run build
 ```
 
 默认测试使用脚本化 Fake LLM，但让响应经过真实解析器、注册表、工具、Runtime 和数据库。真实模型测试需要有效配置，单独运行并记录结果，不能用 Fake LLM 的通过结果代替。
+
+不设开关时，真实模型用例会被 `SKIP`（实测 `74 passed, 2 skipped`，那两个 skip 就是它），浏览器用例仍会照常运行——它们走 Fake LLM，只验证页面交互。
 
 真实模型测试会产生 API 费用，只有显式设置开关后才执行：
 
@@ -219,12 +225,12 @@ git config core.hooksPath .githooks
 
 ## 主要 API
 
-- `POST /api/sessions`、`GET /api/sessions`
+- `POST /api/sessions`、`GET /api/sessions` —— 创建会话需带请求体 `{"model_name": "deepseek-flash", "timezone": "Asia/Shanghai"}`；模型名必须在 `models.toml` 里（否则 400），时区会被校验（非法则 400），字段缺失由 FastAPI 回 422
 - `GET /api/sessions/{id}/messages`
-- `POST /api/sessions/{id}/runs`
+- `POST /api/sessions/{id}/runs` —— 需带请求体 `{"message": "..."}`（单条上限 10MB，超长内容由运行时转存为资源；可选 `request_key` 用于幂等），返回 202 表示已受理，回答走 SSE 或轮询
 - `GET /api/runs/{id}`、`POST /api/runs/{id}/cancel`
 - `GET /api/runs/{id}/events`、`GET /api/runs/{id}/trace`
-- `POST /api/sessions/{id}/resources`
+- `POST /api/sessions/{id}/resources` —— 需带请求体 `{"content": "...", "kind": "text"}`（`kind` 只接受 `text` / `json`）
 
 详细行为见 [设计文档](docs/design.md)，确认记录见 [架构决策](docs/decisions.md)，验收与缺陷修复记录见 [验收报告](docs/qa-report.md) 与 [AI Prompt 与问题解决记录](docs/ai-prompt-log.md)。
 

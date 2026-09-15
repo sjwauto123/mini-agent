@@ -1,0 +1,122 @@
+{
+  "suite": "browser",
+  "description": "真实模型 + Chrome · 渲染检查：回答气泡与执行日志",
+  "script": "tools/qa/qa_browser_render.py",
+  "script_sha256_16": "008f7bea6c328da5",
+  "started_at": "2026-09-15T12:35:17+00:00",
+  "python": "C:\\Users\\Lenovo\\Documents\\ChatGPT\\mini-agent\\.venv\\Scripts\\python.exe",
+  "service": {
+    "base": "http://127.0.0.1:8000",
+    "healthy": true,
+    "models": [
+      "deepseek-flash"
+    ],
+    "health": {
+      "status": "ok"
+    }
+  },
+  "finished_at": "2026-09-15T12:35:33+00:00",
+  "duration_s": 14.5,
+  "exit_code": 0,
+  "totals": {
+    "total": 18,
+    "passed": 18,
+    "failed": 0,
+    "advisory": 0,
+    "skipped": 0
+  },
+  "checks": [
+    {
+      "status": "PASS",
+      "name": "1.0 两轮提问都被服务端受理",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "name": "1.1 无重复的助手气泡",
+      "detail": "气泡文本=['47 × 89 = 4183（由计算器工', '缓存命中是指请求的数据正好已存在于缓存中']"
+    },
+    {
+      "status": "PASS",
+      "name": "1.2 工具轮出现工具芯片",
+      "detail": "芯片=['调用了 1 个工具']"
+    },
+    {
+      "status": "PASS",
+      "name": "1.3 无错误提示条",
+      "detail": "错误=[]"
+    },
+    {
+      "status": "PASS",
+      "name": "1.4 用户气泡与提问一致",
+      "detail": "用户气泡=['用计算器算一下 47*89，然后告诉我结果。', '一句话解释什么是缓存命中。']"
+    },
+    {
+      "status": "PASS",
+      "name": "1.5 思考面板存在",
+      "detail": "面板数=3"
+    },
+    {
+      "status": "PASS",
+      "name": "1.6 回答里没有系统提示词特征串",
+      "detail": "已核对"
+    },
+    {
+      "status": "PASS",
+      "name": "2.1 两轮问答各一条链路",
+      "detail": "turns=2"
+    },
+    {
+      "status": "PASS",
+      "name": "2.2 一个会话级时间线容器",
+      "detail": "flows=1"
+    },
+    {
+      "status": "PASS",
+      "name": "2.3 链路有父子层级缩进",
+      "detail": "depths=['depth-0', 'depth-1']"
+    },
+    {
+      "status": "PASS",
+      "name": "2.4 没有事件落到兜底文案",
+      "detail": "兜底数=0"
+    },
+    {
+      "status": "PASS",
+      "name": "2.5 没有未翻译的英文事件名",
+      "detail": "英文名=[]"
+    },
+    {
+      "status": "PASS",
+      "name": "2.6 出现「开始运行」文案",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "name": "2.6 出现「请求模型」文案",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "name": "2.6 出现「运行完成」文案",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "name": "2.7 工具调用事件已翻译",
+      "detail": "已核对"
+    },
+    {
+      "status": "PASS",
+      "name": "2.8 可见文案里没有内部字段名",
+      "detail": "可见文案=开始运行  请求模型 第 1 次尝试 模型响应完成 2409 毫秒 · 首字 2388 毫秒 · 992 / 54 to"
+    },
+    {
+      "status": "PASS",
+      "name": "2.9 执行日志页无错误文案",
+      "detail": "已核对"
+    }
+  ],
+  "result": "ALL PASS",
+  "model_used": "deepseek-flash"
+}
