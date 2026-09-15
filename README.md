@@ -227,3 +227,14 @@ git config core.hooksPath .githooks
 - `POST /api/sessions/{id}/resources`
 
 详细行为见 [设计文档](docs/design.md)，确认记录见 [架构决策](docs/decisions.md)，验收与缺陷修复记录见 [验收报告](docs/qa-report.md) 与 [AI Prompt 与问题解决记录](docs/ai-prompt-log.md)。
+
+## 已知问题与边界
+
+以下几项是**已知且未修复**的，写在这里以免被全绿的验收结论掩盖：
+
+1. **思考面板偶发复述协议提示**。思考内容的终态优先级会回退到服务商私有推理字段（`reasoning_content`），模型偶尔在其中复述协议提示片段并原样渲染。透出内容为**输出格式约定**，不含安全约束、密钥或其他会话数据；属概率性偶发。详情与处置决策见 [ai-prompt-log §3.9](docs/ai-prompt-log.md)。
+   相关盲点：验收套件只断言终答 `answer`，**不断言 `thinking`**，故此类问题不会被现有用例捕获。
+2. **`.githooks` 不随 clone 传播**。`core.hooksPath` 是仓库本地配置，新克隆的机器需手动执行一次 `git config core.hooksPath .githooks`，否则机械门禁不生效。
+3. **`npm` / `npx` 在部分 Windows 环境被安全策略拦截**。其 bash 包装脚本会转调 `wsl.exe`（被黑名单拦截），此时改用 `npm.cmd` / `npx.cmd`。
+4. **WAL 只缓解、不消除 SSE 取消导致的连接泄漏**。残留读事务的根因（取消安全）未消除；长期存在的残留读者还会阻止 WAL checkpoint。
+5. **`deepseek-flash` 的中文推理语言是概率性的**。绝大多数轮次为中文，偶发 1 轮英文，无法从应用层保证，因此相关断言在验收矩阵中标为 advisory。
