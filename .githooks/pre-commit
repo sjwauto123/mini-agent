@@ -1,0 +1,113 @@
+#!/bin/sh
+# mini-agent 提交前门禁（不依赖提交信息的那几道）
+# ---------------------------------------------------------------------------
+#   1 跨文件批量删除   —— 阻断（历史上 git rm -f 连带删掉过整个 backend/）
+#   3 三类动作人工过目 —— 阻断，需显式确认
+#   4 验收证据是否过期 —— 仅提醒
+#
+# 依赖提交信息的那道门禁（结构等价）在 commit-msg 里，**不能放在这里**：
+# `git commit` 的 pre-commit 钩子运行在"写提交信息之前"，
+# 此时 .git/COMMIT_EDITMSG 里放的是**上一条**提交的信息。
+# 曾因此让「注释：+ 语义改动」顺利提交（前一条恰好也是「注释：」才偶然拦住）。
+#
+# 逃生阀：
+#   GATE_ALLOW_BULK_DELETE=1   确认要批量删除
+#   GATE_REVIEWED=1            确认已人工过目
+#   GATE_RUN_TESTS=1           额外跑一次 pytest（需 8000 端口空闲，约 25s）
+#
+# 启用方式见 .githooks/README.md（一次性 git config core.hooksPath .githooks）
+# ---------------------------------------------------------------------------
+
+LC_ALL=C.UTF-8
+export LC_ALL
+
+REPO_ROOT=$(git rev-parse --show-toplevel) || exit 1
+cd "$REPO_ROOT" || exit 1
+. "$REPO_ROOT/.githooks/lib.sh"
+
+STAGED=$(staged_files)
+DELETED=$(deleted_files)
+FAIL=0
+
+PY=$(resolve_py) || PY=""
+
+# ===========================================================================
+# 门禁 1：跨文件批量删除
+# ===========================================================================
+DEL_COUNT=$(printf '%s\n' "$DELETED" | grep -c '^.')
+if [ "$DEL_COUNT" -ge 3 ]; then
+  if [ "${GATE_ALLOW_BULK_DELETE:-}" = "1" ]; then
+    echo "[门禁 1] 批量删除 $DEL_COUNT 个文件：已被 GATE_ALLOW_BULK_DELETE=1 放行"
+  else
+    echo ""
+    echo "[门禁 1] 阻断：本次提交要删除 $DEL_COUNT 个跟踪文件。"
+    list_paths "$DELETED"
+    echo "    - 这是「一次删除」类动作里最危险的一种：曾经 git rm -f 连带删掉整个 backend/，"
+    echo "      当时未提交的改动全部回退到 HEAD，必须重做。"
+    echo "    - 请逐个确认上面的路径确实都该删。确认无误后："
+    echo "        GATE_ALLOW_BULK_DELETE=1 git commit ..."
+    FAIL=1
+  fi
+fi
+
+# ===========================================================================
+# 门禁 3：三类动作必须人工过目
+# ===========================================================================
+REVIEW_PATTERN='^frontend/src/|^backend/mini_agent/(events|runtime)\.py$|^backend/mini_agent/routers/sse\.py$'
+TOUCHED=$(printf '%s\n' "$STAGED" | grep -E "$REVIEW_PATTERN")
+if [ -n "$TOUCHED" ]; then
+  if [ "${GATE_REVIEWED:-}" = "1" ]; then
+    echo "[门禁 3] 已确认人工过目（GATE_REVIEWED=1）"
+  else
+    echo ""
+    echo "[门禁 3] 阻断：本次改动触及「页面 / 流式 / 展示层」，必须人工看一眼真机表现。"
+    list_paths "$TOUCHED"
+    echo ""
+    echo "    改前面板/流式时要亲眼确认（历史数据显示，这类问题 127 项自动检查全绿也照样漏）："
+    echo "      · 字数备注不是 0 字、思考面板没有复述协议提示"
+    echo "      · 回答气泡不重复、上一条回答不被清空"
+    echo "      · 首片比模型结束先到（真流式），重试会撤回半句而不是叠成两句"
+    echo "      · 运行途中切到执行日志，步骤数会继续增长"
+    echo "    过目之后：GATE_REVIEWED=1 git commit ..."
+    echo "    想顺带把证据刷新一遍：$PY tools/qa/run.py trace-fields"
+    FAIL=1
+  fi
+fi
+
+# ===========================================================================
+# 门禁 4：验收证据是否比改动旧（仅提醒，不阻断）
+# ===========================================================================
+EVIDENCE=$(ls -1t tools/qa/evidence/*.json 2>/dev/null | head -1)
+if [ -n "$EVIDENCE" ] && [ -n "$STAGED" ]; then
+  # 注意：本机 `sort` 会解析到 Windows 的 sort.exe（不认 -rn），所以只用 stat + awk。
+  NEWEST_SRC=$(printf '%s\n' "$STAGED" | while read -r f; do
+    [ -f "$f" ] && { stat -c %Y "$f" 2>/dev/null || echo 0; }
+  done | awk 'BEGIN{m=0}{if($1+0>m)m=$1+0}END{print m+0}')
+  EVIDENCE_TS=$(stat -c %Y "$EVIDENCE" 2>/dev/null || echo 0)
+  if [ "$NEWEST_SRC" -gt "$EVIDENCE_TS" ]; then
+    echo ""
+    echo "[门禁 4] 提醒：验收证据比本次改动旧，当前证据不能代表这次提交。"
+    echo "    $EVIDENCE"
+    echo "    刷新：$PY tools/qa/run.py all"
+  fi
+fi
+
+# ===========================================================================
+# 可选：跑一次测试
+# ===========================================================================
+if [ "${GATE_RUN_TESTS:-}" = "1" ]; then
+  echo ""
+  echo "[附加] 跑 pytest（需 8000 端口空闲）"
+  if ! "$PY" -m pytest -q -p no:cacheprovider --basetemp=.pytest-tmp/pt; then
+    echo "    - 测试未通过。"
+    FAIL=1
+  fi
+fi
+
+if [ "$FAIL" = "1" ]; then
+  gate_blocked_footer
+  exit 1
+fi
+
+echo "提交前门禁全部通过。"
+exit 0

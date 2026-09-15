@@ -1,0 +1,107 @@
+#!/bin/sh
+# mini-agent 提交信息门禁（依赖提交信息的规则只能放在这里）
+# ---------------------------------------------------------------------------
+#   2  结构等价     —— 提交信息以 注释：/格式：/工程： 开头且改了 .py 时，
+#                      要求代码与 HEAD 结构等价（AST + token 比对）
+#   2b 只增不删     —— 提交信息以 注释： 开头时，deletions 必须为 0
+#
+# 为什么是 commit-msg 而不是 pre-commit：
+# `git commit` 的 pre-commit 钩子运行在**写提交信息之前**，那时
+# .git/COMMIT_EDITMSG 里还是**上一条**提交的信息。曾因此出现：
+# 「注释：+ 改了一个字符串字面量」被放行（上一条恰好也是「注释：」才偶然拦住），
+# 也就是说门禁 2 会**看情况随机生效**。commit-msg 拿到的才是本次信息。
+#
+# 逃生阀：
+#   GATE_SKIP_AST_EQUIV=1      跳过结构等价校验
+#   GATE_COMMIT_MSG="..."      自测用：直接指定提交信息
+#
+# 启用方式见 .githooks/README.md（一次性 git config core.hooksPath .githooks）
+# ---------------------------------------------------------------------------
+
+LC_ALL=C.UTF-8
+export LC_ALL
+
+REPO_ROOT=$(git rev-parse --show-toplevel) || exit 1
+cd "$REPO_ROOT" || exit 1
+. "$REPO_ROOT/.githooks/lib.sh"
+
+# commit-msg 钩子的 $1 就是提交信息文件路径（正常由 git 传入）
+MSG_FILE=${GATE_COMMIT_MSG_FILE:-$1}
+if [ -n "${GATE_COMMIT_MSG:-}" ]; then
+  MSG="$GATE_COMMIT_MSG"
+elif [ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ]; then
+  MSG=$(head -1 "$MSG_FILE" 2>/dev/null | tr -d '\r')
+else
+  MSG=""
+fi
+
+# 取「注释：xxx」里的「注释」，兼容半角冒号
+case "$MSG" in
+  *：*) PREFIX=${MSG%%：*} ;;
+  *:*)  PREFIX=${MSG%%:*} ;;
+  *)    PREFIX="" ;;
+esac
+
+# 只有这三类"声明为零行为变更"的前缀才做结构等价校验
+case "$PREFIX" in
+  注释|格式|工程) ;;
+  *) exit 0 ;;
+esac
+
+STAGED=$(staged_files)
+if [ -z "$STAGED" ]; then
+  exit 0
+fi
+
+if [ "${GATE_SKIP_AST_EQUIV:-}" = "1" ]; then
+  echo "[门禁 2] 已被 GATE_SKIP_AST_EQUIV=1 跳过（$PREFIX 类提交）"
+  exit 0
+fi
+
+PY=$(resolve_py) || PY=""
+if [ -z "$PY" ]; then
+  echo "[门禁 2] 跳过：找不到 python 解释器，无法做结构等价校验。"
+  exit 0
+fi
+
+FAIL=0
+
+# ===========================================================================
+# 门禁 2：结构等价
+# ===========================================================================
+PY_FILES=$(printf '%s\n' "$STAGED" | grep '\.py$')
+if [ -n "$PY_FILES" ]; then
+  echo ""
+  echo "[门禁 2] 「$PREFIX」类提交：校验代码结构等价"
+  if ! "$PY" tools/gates/check_ast_equiv.py --staged; then
+    echo "    - 若这次确实改了行为，请改用 修复：/功能：/重构： 前缀。"
+    FAIL=1
+  fi
+fi
+
+# ===========================================================================
+# 门禁 2b：注释类提交 deletions 必须为 0
+# ===========================================================================
+if [ "$PREFIX" = "注释" ]; then
+  REMOVED=$(git diff --cached --numstat -- $STAGED | awk '$2+0 > 0 {print "    " $2 " 行删除  " $3}')
+  if [ -n "$REMOVED" ]; then
+    echo ""
+    echo "[门禁 2b] 阻断：「注释」类提交不允许删除任何行。"
+    printf '%s\n' "$REMOVED"
+    echo "    - 删行数偏大时，优先怀疑两种原因："
+    echo "      ① 整文件重写（历史上因此丢过 runtime.py 尾部 300 行）；"
+    echo "      ② 行尾被整体改写（本仓库 App.tsx / styles.css 是 CRLF，其余是 LF，"
+    echo "         core.autocrlf=false，所以改写行尾会被逐行计成删除+新增）。"
+    echo "    - 规则见 AGENTS.md「零风险任务的机械门禁」。"
+    FAIL=1
+  fi
+fi
+
+if [ "$FAIL" = "1" ]; then
+  gate_blocked_footer
+  exit 1
+fi
+
+echo ""
+echo "提交信息门禁通过（$PREFIX 类提交结构等价）。"
+exit 0
