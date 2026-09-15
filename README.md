@@ -98,7 +98,7 @@ React 前端 ──HTTP / SSE──▶ FastAPI 接口层（routers/）
 - Python 3.11+
 - Node.js 20+
 
-安装（下面代码块用 `cd` 而不是 `Set-Location`，这样在 PowerShell、cmd 和 Git Bash 里都能直接粘贴执行）：
+安装（下面代码块用 `cd` 而不是 `Set-Location`，这样在 PowerShell、cmd 和 Git Bash 里都能直接粘贴执行）。**只想跑起来的话可以跳过本节，直接用「初始化与启动」里的 `start.cmd` 一条命令搞定**：
 
 ```powershell
 python -m venv .venv
@@ -139,6 +139,20 @@ Copy-Item .env.example .env
 
 ## 初始化与启动
 
+### 一条命令（推荐）
+
+仓库根目录的 `start.cmd` 把「手动分步」里的每一步合成一条命令：缺虚拟环境就创建、缺依赖就安装、缺配置就从示例复制、重新构建前端、执行数据库迁移，最后启动服务。
+
+```cmd
+start.cmd
+```
+
+首次运行会发现还没有 `.env`，于是从 `.env.example` 复制一份并**停下**，提示你填入 `DEEPSEEK_API_KEY`；填好后再跑一次即可。此后每次启动都只需要这一条命令。
+
+`start.cmd nopause` 供脚本化调用（跳过结束时的暂停）。脚本只做「幂等的准备 + 启动」，**不会覆盖**你已有的 `.env` 与 `models.toml`。
+
+### 手动分步（想看清每一步在做什么）
+
 ```powershell
 .\.venv\Scripts\alembic.exe -c backend/alembic.ini upgrade head
 .\.venv\Scripts\python.exe -m uvicorn --app-dir backend mini_agent.api:app --host 127.0.0.1 --port 8000
@@ -157,6 +171,8 @@ npm run dev
 $env:VITE_API_TARGET = "http://127.0.0.1:8001"
 npm run dev
 ```
+
+也可以把它写进 `frontend/.env`（复制 `frontend/.env.example`）。**注意：写在仓库根 `.env` 里是无效的** —— Vite 只读自己的 env 目录（`frontend/`），实测根 `.env` 里同名变量会被静默忽略。
 
 打开 [http://localhost:5173](http://localhost:5173)。**必须用 `localhost`**：Vite 只绑定 IPv6 回环，实测 `127.0.0.1:5173` 会直接连接被拒（Windows 错误 10061），`localhost` 与 `[::1]` 都正常。生产式本地运行可先执行 `npm run build`，FastAPI 会从 `frontend/dist` 提供页面。
 
