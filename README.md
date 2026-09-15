@@ -105,8 +105,15 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.lock
 Set-Location frontend
 npm install
-npx playwright install chromium
 Set-Location ..
+```
+
+若本机安全策略拦住了 `npm` / `npx`（某些 Windows 环境里它们是脚本包装器，会经 `wsl.exe` 路由而被拦下），改用同目录的 `npm.cmd` / `npx.cmd`，例如 `npm.cmd run build`。
+
+浏览器测试复用系统已安装的 Chrome 或 Edge，两者都找不到时会自动跳过、不会判定失败。确需 Playwright 自带 Chromium 时再执行：
+
+```powershell
+.\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
 ## 模型配置
@@ -118,7 +125,11 @@ Copy-Item .env.example .env
 # 编辑 .env，填入新的 DEEPSEEK_API_KEY
 ```
 
-如需使用其他环境文件，可设置 `MINI_AGENT_ENV_FILE`。
+如需使用其他环境文件，可设置 `MINI_AGENT_ENV_FILE`；如需使用其他配置文件，可设置 `MINI_AGENT_CONFIG` 指向另一个 TOML。
+
+`models.toml` 缺失不会报错，此时全部走内置默认值（等于没有配置任何模型），因此刚克隆的仓库可以直接运行离线测试；要发起真实模型请求则必须补上配置。
+
+`data_dir`（默认 `.mini-agent`）同时决定数据库位置与迁移目标，可用 `MINI_AGENT_DATA_DIR` 覆盖；`backend/alembic.ini` 里写死的 `sqlalchemy.url` 会被迁移脚本按上述配置覆盖，不必修改。
 
 `mode = "native"` 使用端点原生工具调用；`mode = "json"` 使用统一 JSON 输出协议。首版通过 `httpx` 接入一个选定端点，不承诺所有兼容服务的私有扩展字段。
 
@@ -143,7 +154,7 @@ $env:VITE_API_TARGET = "http://127.0.0.1:8001"
 npm run dev
 ```
 
-打开 [http://127.0.0.1:5173](http://127.0.0.1:5173)。生产式本地运行可先执行 `npm run build`，FastAPI 会从 `frontend/dist` 提供页面。
+打开 [http://localhost:5173](http://localhost:5173)（Vite 默认只绑定 `localhost`，用 `127.0.0.1` 可能连不上）。生产式本地运行可先执行 `npm run build`，FastAPI 会从 `frontend/dist` 提供页面。
 
 两个浏览器窗口可以分别创建会话；当前会话 ID 保存在各自 URL 查询参数中，历史、摘要、待办和外置资源不会跨会话共享。
 
