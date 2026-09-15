@@ -69,8 +69,10 @@ async def test_deepseek_native_tool_loop(tmp_path: Path):
         return result
 
     try:
-        direct = await ask("Reply with exactly READY. Do not call a tool.")
-        assert "READY" in direct.answer.upper()
+        # 标记必须用中文：产品刻意要求"推理过程与回答一律使用中文"（LANGUAGE_HINT），
+        # 用 READY 这类英文标记时模型会把它翻译成"就绪"，断言随机失败。
+        direct = await ask("不要调用工具，只回复两个字：就绪")
+        assert "就绪" in direct.answer
 
         calculation = await ask("Use the calculator tool to calculate 37 * 29, then report the result.")
         assert any(
@@ -150,9 +152,9 @@ def test_deepseek_browser_question_answer(tmp_path: Path):
                 page.goto(f"http://127.0.0.1:{port}")
                 page.get_by_role("button", name="新建会话").first.click()
                 expect(page).to_have_url(re.compile(r"\?session=[0-9a-f-]{36}$"))
-                page.get_by_placeholder("输入消息").fill("Reply with exactly READY. Do not call a tool.")
-                page.get_by_placeholder("输入消息").press("Enter")
-                expect(page.locator(".assistant .bubble").last).to_contain_text("READY", timeout=90_000)
+                page.get_by_placeholder("请输入您想要咨询的问题...").fill("不要调用工具，只回复两个字：就绪")
+                page.get_by_placeholder("请输入您想要咨询的问题...").press("Enter")
+                expect(page.locator(".assistant .bubble").last).to_contain_text("就绪", timeout=90_000)
                 expect(page.locator(".error-bar")).to_have_count(0)
             finally:
                 browser.close()
