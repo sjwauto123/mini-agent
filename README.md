@@ -177,6 +177,46 @@ $env:RUN_REAL_MODEL_TESTS = "1"
 
 该文件同时覆盖 Runtime 工具循环，以及浏览器页面经 HTTP/SSE 调用真实模型的完整问答链路。普通浏览器测试使用 Fake LLM，只验证页面交互、失败提示、Session 隔离和恢复。
 
+### 验收套件（`tools/qa`）
+
+`tools/qa/` 是**可复跑、会产出证据**的验收套件，替代原先散落在被忽略目录里的一次性脚本。先起服务（须在仓库根目录执行），再运行：
+
+```powershell
+.\.venv\Scripts\python.exe tools/qa/run.py list     # 列出套件
+.\.venv\Scripts\python.exe tools/qa/run.py all      # 跑一遍（除 boundary 外）
+.\.venv\Scripts\python.exe tools/qa/run.py smoke    # 跑单个
+```
+
+| 套件 | 调模型 | 内容 |
+|---|---|---|
+| `smoke` | 是 | 快速冒烟：回答正确 / 真流式 / 工具增量 |
+| `behavior` | 是 | 行为检查：回答规范性 / 权限边界 / 前端载荷 / 链路 |
+| `matrix` | 是 | 上下文加固回归（工具链 / 记忆 / 注入 / 边界） |
+| `browser` | 是 + Chrome | 渲染检查：回答气泡与执行日志 |
+| `trace-fields` | 否 | 历史数据渲染检查（缺数据报 SKIP） |
+| `trace-live` | 是 + Chrome | 运行期间执行日志刷新 |
+| `boundary` | 是 | 外置资源边界（约 2.8M 字，代价高，`all` 默认跳过） |
+
+结果写入 `tools/qa/evidence/`（各套件 JSON 结果与截图）。详见 [tools/qa/README.md](tools/qa/README.md)。
+
+### 提交前机械门禁（`tools/gates` + `.githooks`）
+
+`tools/gates/` 面向「零风险任务」做机械校验：`check_ast_equiv.py` 用 AST + token 比对判断一次改动是否**只改注释**（删行、改字符串字面量都会被判成行为变更），避免"以加注释为名改坏逻辑"。
+
+它们是**独立脚本，不走 pytest**（只有 `__main__` 入口），需单独运行：
+
+```powershell
+.\.venv\Scripts\python.exe tools/gates/selftest.py
+```
+
+`.githooks/` 把上述规则变成真正阻断提交的钩子。启用（每台机器一次；`core.hooksPath` 是仓库本地配置，不随 clone 传播）：
+
+```powershell
+git config core.hooksPath .githooks
+```
+
+协作约定与门禁逃生阀见 [AGENTS.md](AGENTS.md) 与 [.githooks/README.md](.githooks/README.md)。
+
 ## 主要 API
 
 - `POST /api/sessions`、`GET /api/sessions`
