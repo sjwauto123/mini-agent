@@ -53,7 +53,11 @@ async def test_tool_loop_and_followup_context(services):
 
 
 async def test_thinking_summary_and_private_reasoning_stay_separate(services):
-    """思考过程用决策摘要展示；思考模式的私有推理只按协议回传，不进界面、不进决策。"""
+    """思考内容与协议私有推理的边界：私有推理须按协议原样回传，但不得作为 thinking 回灌进上下文。
+
+    取值优先级是 决策说明 → 正文 → 私有推理。本用例的两个响应都没有决策说明，
+    因此界面的 thinking 落到私有推理上——即"模型没给决策说明时，就如实展示它给出的内容"。
+    """
     model = ScriptedModel([
         tool("c1", "calculator", '{"expression":"1+1"}', content="先算一下。", reasoning="私有推理：这一步应该调用计算器。"),
         final("答案是 2。", reasoning="私有推理：已经拿到计算结果，可以直接回答。"),
