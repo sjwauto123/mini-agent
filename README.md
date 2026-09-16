@@ -13,6 +13,22 @@
 
 搜索和天气工具使用固定模拟数据，页面和工具结果会标明 `mock`，不代表实时联网结果。
 
+## 界面
+
+问答视图：左侧是会话列表与模块导航，右侧是 Agent 的回答。每条助手消息可展开「思考过程」，工具轮会显示工具调用芯片；第二轮演示纯对话追问。
+
+![问答界面](docs/images/01-chat.png)
+
+Agent Loop 的四步在界面上是直接可见的 —— 模型先判断该调用哪个工具，工具结果回灌后再给出回答；模拟数据会被如实标注为「模拟数据」：
+
+![工具调用与结果回灌](docs/images/03-tool-call.png)
+
+执行日志视图把一次会话的所有问答串成一条带层级的连续链路，并记录每步的 token、耗时与重试。下图中第 1 轮的第 2 次模型请求恰好触发过一次自动重试（`Server disconnected`），可见重试对上层是透明的：
+
+![执行日志](docs/images/02-trace.png)
+
+截图由 `tools/qa/make_readme_shots.py` 生成（真实服务 + 真实模型 + 系统 Chrome），可重跑复现。
+
 ## 系统设计
 
 ### 分层
@@ -220,6 +236,12 @@ $env:RUN_REAL_MODEL_TESTS = "1"
 | `boundary` | 是 | 外置资源边界（约 2.8M 字，代价高，`all` 默认跳过） |
 
 结果写入 `tools/qa/evidence/`（各套件 JSON 结果与截图）。详见 [tools/qa/README.md](tools/qa/README.md)。
+
+这里另有一个**不属于套件**的辅助脚本 `make_readme_shots.py`：它不产出断言，只产出本文档「界面」一节的演示图（写入 `docs/images/`），因此没有登进 `run.py` 的套件表：
+
+```powershell
+.\.venv\Scripts\python.exe tools/qa/make_readme_shots.py
+```
 
 ### 提交前机械门禁（`tools/gates` + `.githooks`）
 
